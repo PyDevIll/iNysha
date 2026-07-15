@@ -116,7 +116,7 @@ async def start_app():
         name="INYSHA",
         base_prompts=[
             ("## **IDENTITY**\n", "system_prompts/core.md"),
-            ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),
+            # ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),
             ("\n## **Tools Guidelines & Best Practices**\n", "system_prompts/tools_guidelines.md"),
         ],
         last_memory=[
