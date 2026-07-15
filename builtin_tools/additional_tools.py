@@ -21,39 +21,59 @@ def _smart_decode(data: bytes) -> str:
     return data.decode('utf-8', errors='replace')
 
 
-async def ping() -> str:
-    """Simple ping/pong health check. Returns 'pong' with current timestamp."""
-    from datetime import datetime
-    return json.dumps({
-        "result": "pong",
-        "timestamp": datetime.now().isoformat(),
-    }, ensure_ascii=False)
+import asyncio
+import json
+import os
+import sys
+import subprocess
 
+# Maximum command-line length for CreateProcess on Windows
+_MAX_CMD_LEN = 32767
 
 async def exec_python(parameter: str, timeout: int = 30) -> str:
-    """WARNING: Full system execution access. This tool should ONLY be used when explicitly requested by the user for debugging or system tasks.
+    """⚠️ WARNING: Full system access. Use ONLY on explicit user request.
 
-    Execute arbitrary Python code for quick testing and debugging.
+    Execute arbitrary Python code.
+    Supports:
+      - -c "code"   → inline code (quotes are automatically stripped)
+      - file.py     → run a Python file
+      - raw code    → auto-wrapped as -c
 
-    Parameter can be:
-      - `-c "print('hello')"` — inline code (like python -c)
-      - A `.py` filename (absolute or relative to agent's CWD)
-      - Raw Python code (auto-wrapped as -c)
-    
-    Returns JSON: {"stdout": "...", "stderr": "..."}
+    Returns JSON: {"stdout": "...", "stderr": "...", "returncode": int}
     """
-    # Determine execution mode
+    # 1. Determine execution mode and sanitize the argument
+    args = None
     if parameter.startswith('-c '):
-        code = parameter[3:]
+        # Strip the -c prefix, then remove leading/trailing whitespace
+        code = parameter[3:].strip()
+        # Remove outermost matching quotes (single or double)
+        if (code.startswith('"') and code.endswith('"')) or \
+           (code.startswith("'") and code.endswith("'")):
+            code = code[1:-1]
         args = ['-c', code]
     elif os.path.isfile(parameter):
         args = [parameter]
     elif os.path.isfile(os.path.join(os.getcwd(), parameter)):
         args = [os.path.join(os.getcwd(), parameter)]
     else:
-        # Treat as raw code
+        # Treat as raw code (no quotes to strip)
         args = ['-c', parameter]
 
+    # 2. Prevent overly long command lines
+    total_cmd = sys.executable + ' ' + ' '.join(args)
+    if len(total_cmd) > _MAX_CMD_LEN:
+        return json.dumps({
+            "stdout": "",
+            "stderr": f"Command exceeds Windows limit of {_MAX_CMD_LEN} characters",
+            "returncode": -1,
+        }, ensure_ascii=False)
+
+    # 3. Force UTF-8 output for Python
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"  # Python 3.7+ global UTF-8 mode
+
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -61,23 +81,39 @@ async def exec_python(parameter: str, timeout: int = 30) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.getcwd(),
+            env=env,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
+
+        # With PYTHONIOENCODING=utf-8, output is guaranteed UTF-8.
+        # We use errors='replace' as a safety net.
         return json.dumps({
-            "stdout": _smart_decode(stdout),
-            "stderr": _smart_decode(stderr),
-            "returncode": proc.returncode,
+            "stdout": stdout.decode('utf-8', errors='replace'),
+            "stderr": stderr.decode('utf-8', errors='replace'),
+            "returncode": proc.returncode if proc.returncode is not None else -1,
         }, ensure_ascii=False)
+
     except asyncio.TimeoutError:
-        proc.kill()
+        if proc:
+            # Gracefully terminate, then kill if necessary
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
         return json.dumps({
             "stdout": "",
             "stderr": f"Timeout ({timeout}s) exceeded",
             "returncode": -1,
         }, ensure_ascii=False)
+
     except Exception as e:
+        if proc:
+            proc.kill()
+            await proc.wait()
         return json.dumps({
             "stdout": "",
             "stderr": f"Execution error: {e}",
@@ -86,15 +122,12 @@ async def exec_python(parameter: str, timeout: int = 30) -> str:
 
 
 async def exec_shell(command: str, timeout: int = 30) -> str:
-    """WARNING: Full system execution access. This tool should ONLY be used when explicitly requested by the user for debugging or system tasks.
+    """Execute arbitrary shell command on Windows 10 using cmd.exe /c.
 
-    Execute arbitrary shell command on Windows 10 using cmd.exe /c.
-
-    ⚠️ DANGEROUS: Full shell access. Use with extreme caution.
-    - Runs via cmd.exe /c {command}
-    - Supports batch commands, pipes, redirects (>, |, &&)
-    - Returns JSON: stdout, stderr, returncode
-    - Timeout kills the process
+    - Forces UTF-8 output via `chcp 65001`.
+    - Returns JSON: stdout, stderr, returncode.
+    - Timeout kills the process.
+    - ⚠️ WARNING: Full system access. Use ONLY on explicit user request.
 
     Args:
         command: Shell command string (e.g., "dir /b", "ipconfig", "echo hello")
@@ -103,9 +136,21 @@ async def exec_shell(command: str, timeout: int = 30) -> str:
     Returns:
         JSON string with stdout, stderr, returncode
     """
+    # 1. Prevent overly long commands
+    if len(command) > 8190:
+        return json.dumps({
+            "stdout": "",
+            "stderr": "Command exceeds cmd.exe limit of 8191 characters",
+            "returncode": -1,
+        }, ensure_ascii=False)
+
+    # 2. Force UTF-8 output
+    cmd = f"chcp 65001 >nul & {command}"
+
+    proc = None
     try:
         proc = await asyncio.create_subprocess_shell(
-            command,
+            cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.getcwd(),
@@ -114,23 +159,43 @@ async def exec_shell(command: str, timeout: int = 30) -> str:
             proc.communicate(), timeout=timeout
         )
         return json.dumps({
-            "stdout": _smart_decode(stdout),
-            "stderr": _smart_decode(stderr),
-            "returncode": proc.returncode,
+            "stdout": _decode_output(stdout),
+            "stderr": _decode_output(stderr),
+            "returncode": proc.returncode if proc.returncode is not None else -1,
         }, ensure_ascii=False)
+
     except asyncio.TimeoutError:
-        proc.kill()
+        if proc:
+            proc.kill()
+            await proc.wait()  # allow process to exit
         return json.dumps({
             "stdout": "",
             "stderr": f"Timeout ({timeout}s) exceeded",
             "returncode": -1,
         }, ensure_ascii=False)
+
     except Exception as e:
+        if proc:
+            proc.kill()
+            await proc.wait()
         return json.dumps({
             "stdout": "",
             "stderr": f"Execution error: {e}",
             "returncode": -1,
         }, ensure_ascii=False)
+
+
+def _decode_output(data: bytes) -> str:
+    """Decode bytes with fallback encodings."""
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            # OEM code page (e.g., CP437)
+            return data.decode(sys.stdout.encoding or 'cp437')
+        except UnicodeDecodeError:
+            # Never fails
+            return data.decode('latin-1', errors='replace')
 
 
 async def schedule_task(prompt: str, delay_minutes: int = 10) -> str:
@@ -170,11 +235,6 @@ async def cancel_scheduled_task(task_id: str) -> str:
 
 
 TOOL_DEFINITIONS = [
-    ("ping", ping, "Simple ping/pong health check. Returns pong with current timestamp.", {
-        "type": "object",
-        "properties": {},
-        "required": [],
-    }),
     ("exec_python", exec_python, "⚠️ WARNING: Full system access. Use ONLY on explicit user request. Execute arbitrary Python code for quick testing and debugging. "
      "Pass code as: -c \"print('hello')\", or a .py filename, or raw code string.", {
         "type": "object",
