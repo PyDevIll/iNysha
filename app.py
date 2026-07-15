@@ -4,10 +4,15 @@ from loguru import logger
 
 from agent import Agent
 from builtin_tools import register_all as register_builtin_tools
-from scheduler import get_scheduler
 from time import time
 import re
+import sys
 
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    logger.exception("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = global_exception_handler
 
 # auto-download incoming files to data/downloads/
 DOWNLOADS_DIR = Path(__file__).resolve().parent / "data" / "downloads"
@@ -16,6 +21,49 @@ DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 request_queue = None  # will be set in main
 agent = None
 
+
+# ---- Worker coroutine (processes requests sequentially) ----
+async def worker() -> None:
+    from components.max import process_max_message
+    while True:
+        req = await request_queue.get()
+        try:
+            if req["type"] == "max":
+                await process_max_message(req["update"])
+            # elif req["type"] == "scheduled":
+            #     await process_scheduled_task(req["task"])
+            # elif req["type"] == "tts":
+            #     await process_voice_reply(req["text"])
+            # elif req["type"] == "user":
+            #     await process_command_prompt(req["prompt"])
+            # else:
+            logger.warning(f"Unknown request type: {req.get('type')}")
+        except Exception as e:
+            logger.exception(f"Worker failed processing {req.get('type')}: {e}")
+        finally:
+            request_queue.task_done()
+
+
+async def get_command():
+    while True:
+        user_request = await asyncio.to_thread(input, "User command: ")
+        parsed = user_request.split(" ", 1)
+        command = parsed[0]
+        parameters = parsed[1] if len(parsed) > 1 else None
+
+        print("Got user command:", command, ", parameters:", parameters)
+        if command == "/v":     # voice
+            if tts_stt_enabled:
+                tts_stt_disable(tts_context)
+            else:
+                tts_context = tts_stt_enable()
+            tts_stt_enabled = not tts_stt_enabled
+        if command == "/p":     # prompt
+            if parameters:
+                await request_queue.put({"type": "user", "prompt": f"[Command prompt]: {parameters}"})
+
+
+# --------- APP ENTRY POINT -----------
 async def start_app():
     # Configure logging
     logger.remove()
@@ -69,3 +117,14 @@ async def start_app():
     )
     agent.add_helper_agent(helper_agent)
 
+    # Start all components concurrently
+    logger.info("Starting worker, scheduler checker and http listening...")
+    worker_task = asyncio.create_task(worker())
+    checker_task = asyncio.create_task(scheduler_checker())
+    http_task = asyncio.create_task(run_http_server())
+
+    command_task = asyncio.create_task(get_command())
+
+
+    logger.info("All components started. Awaiting tasks...")
+    await asyncio.gather(worker_task, checker_task, http_task, command_task)

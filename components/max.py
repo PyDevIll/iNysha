@@ -1,13 +1,15 @@
+import os
+from loguru import logger
 from fastapi import FastAPI, Request, BackgroundTasks
 import uvicorn
-from max_bot import MAXBot
+from lib.max_bot import MAXBot
 from tool_registry import get_registry
+from app import agent, request_queue
 
 
-app = FastAPI()
-request_queue = None  # will be set in main
+fast_api_app = FastAPI()
 
-@app.post("/max-webhook")
+@fast_api_app.post("/max-webhook")
 async def max_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Receive forwarded MAX updates from the serverless function.

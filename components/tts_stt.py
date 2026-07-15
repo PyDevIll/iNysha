@@ -70,5 +70,37 @@ def tts_stt_disable(tts_context):
     stt_request_to_llm_queue.clear()
     print("> Voice disabled")
 
+
+def _sanitize_for_tts(text: str) -> str:
+    """
+    Очищает текст от символов, которые не озвучиваются или ломают синтез речи:
+    - удаляет маркдаун-символы (*, _, `, ~, #, >, +, -, =, |, [], {}, () и т.д.)
+    - заменяет слэши, обратные слэши, звёздочки, подчёркивания на пробелы
+    - удаляет эмодзи и прочие непечатные символы
+    - сохраняет буквы, цифры, пробелы и базовую пунктуацию (.,!?;:'-–—)
+    - схлопывает множественные пробелы в один
+    """
+    # Оставляем только буквы, цифры, пробелы, и разрешённые знаки препинания
+    allowed = r"[^a-zA-Zа-яА-ЯёЁ0-9\s\.\,\!\?\;\:\'\-\–\—]"
+    cleaned = re.sub(allowed, " ", text)
+    # Удаляем множественные пробелы
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+async def process_voice_reply(text):
+    async def reasoning_callback(thought):
+        print(" > ...", thought)
+
+    response_text = await agent.run_with_crash_recovery(
+        initial_user_request=text,
+        reasoning_callback=reasoning_callback,
+    )
+
+    if response_text:
+        sanitized_text = _sanitize_for_tts(response_text)
+        tts_send_for_speaking(sanitized_text)
+        await tts_speak()
+
 # |                                                |
 # |---------- / TTS - STT Dialogue code -----------|

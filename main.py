@@ -1,12 +1,8 @@
 import asyncio
 from dotenv import load_dotenv
-import sys
+from loguru import logger
+import app
 
-
-def global_exception_handler(exc_type, exc_value, exc_traceback):
-    logger.exception("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
-
-sys.excepthook = global_exception_handler
 
 async def main() -> None:
     await app.start_app()
