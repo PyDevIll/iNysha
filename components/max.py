@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 import uvicorn
 from lib.max_bot import MAXBot
 from tool_registry import get_registry
-from app import agent, request_queue
+from app import get_agent, get_request_queue, DOWNLOADS_DIR
 
 
 fast_api_app = FastAPI()
@@ -14,7 +14,7 @@ async def max_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Receive forwarded MAX updates from the serverless function.
     """
-    global request_queue
+    request_queue = get_request_queue()
     if request_queue is None:
         return {"ok": False, "error": "Queue not initialized"}
 
@@ -30,7 +30,7 @@ async def max_webhook(request: Request, background_tasks: BackgroundTasks):
 
 async def run_http_server():
     """Run FastAPI with uvicorn in a subprocess or thread."""
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    config = uvicorn.Config(fast_api_app, host="0.0.0.0", port=8000, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -41,9 +41,9 @@ bot = MAXBot(token=os.environ.get("MAX_BOT_TOKEN"), reasoning_chat_id=326963375)
 registry = get_registry()
 registry.set_bot(bot)
 
-# File handler: auto-download incoming files to data/downloads/
-DOWNLOADS_DIR = Path(__file__).resolve().parent / "data" / "downloads"
-DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+# # File handler: auto-download incoming files to data/downloads/
+# DOWNLOADS_DIR = Path(__file__).resolve().parent / "data" / "downloads"
+# DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---- Actual processing logic for user messages ----
@@ -163,6 +163,7 @@ async def process_max_message(update: dict) -> None:
         await bot.send_reasoning(thought)
 
     # ---- 7. Запуск агента и отправка ответа ----
+    agent = get_agent()
     response = await agent.run_with_crash_recovery(
         initial_user_request=enhanced_request,
         reasoning_callback=reasoning_callback,

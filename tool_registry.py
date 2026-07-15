@@ -26,7 +26,7 @@ class ToolDef:
 class ToolRegistry:
     """Async-first tool registry with hot-reload via importlib."""
 
-    def __init__(self, tools_package: str = "deep_agent_future.builtin_tools"):
+    def __init__(self, tools_package: str = "builtin_tools"):
         self._tools_package = tools_package
         self._tools: Dict[str, ToolDef] = {}
         self._version: int = 0
@@ -176,7 +176,7 @@ class ToolRegistry:
         # ⚠️ Clear registry BEFORE re-registration so removed tools are purged
         self._tools.clear()
         try:
-            from deep_agent_future.builtin_tools import register_all
+            from builtin_tools import register_all
             register_all(self)
         except Exception as e:
             logger.error(f"register_all failed: {e}")
@@ -237,7 +237,7 @@ def get_registry() -> ToolRegistry:
         _registry = ToolRegistry()
     if not _registry_initialized:
         try:
-            from deep_agent_future.builtin_tools import register_all
+            from builtin_tools import register_all
             register_all(_registry)
             _registry_initialized = True
         except ImportError:

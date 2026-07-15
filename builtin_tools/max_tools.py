@@ -159,7 +159,7 @@ async def max_send_message(
     Args:
         chat_id: MAX chat ID (numeric string, e.g., "123456789").
         text: The message text to send.
-        format: "markdown" (default) or "plain". If markdown, MAX will render bold, italic, etc.
+        format: "markdown" (default) or "plain". If Markdown, MAX will render bold, italic, etc.
 
     Returns:
         dict: {"ok": True, "result": {...}} on success,
@@ -247,7 +247,7 @@ async def max_get_messages(
 # ----------------------------------------------------------------------
 
 def _get_bot_from_registry():
-    from deep_agent_future.tool_registry import get_registry
+    from tool_registry import get_registry
     registry = get_registry()
     bot = registry.get_bot()
     if bot is None:
