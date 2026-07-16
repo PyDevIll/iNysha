@@ -147,7 +147,8 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 **New tools:** after adding any new tool module, immediately call `reload_tools` to make it available.
 **Aider workflow:** identify the need → formulate precise instruction → list target files → call `aider_run`. Always verify changes with `git_diff` afterward. Do not use Aider for single‑file trivial edits — `fs_aedit`/`fs_edit_blocks` are faster.
 **Audio / Transcription:** use `yandex_transcribe` for transcribing voice messages (OGG/MP3/WAV). Use `url` mode for CDN links (no disk write) or `audio_path` for local files.
-**Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL images. Supported formats: JPEG, PNG, GIF, WEBP. Powered by Qwen VL (`qwen3-vl-plus`).
+**Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL-based images, `analyze_dynamic_scene` to capture the screen in motion. Supported formats: JPEG, PNG, GIF, WEBP. Powered by Qwen VL (`qwen3-vl-plus`).
+    Ask a specific question in the `query` parameter, based on the context of the interaction, about what you expect to see in the given visual content. 
 **Scheduler:** use `schedule_task` for periodic/autonomous tasks. Tasks fire on the next user message after `delay_minutes`. Cancel with `cancel_scheduled_task`.
 **MAX Messenger specifics:**
     - **Always obtain `chat_id`** from the user's message context (shown as `Current chat_id: ...`). Do not guess or hardcode chat IDs unless explicitly provided.

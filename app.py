@@ -33,7 +33,7 @@ def get_agent():
 async def worker() -> None:
     from components.max import process_max_message
     from components.cmd_line import process_command_prompt
-
+    from components.tts_stt import process_voice_reply
     while True:
         req = await request_queue.get()
         try:
@@ -41,10 +41,10 @@ async def worker() -> None:
                 await process_max_message(req["update"])
             elif req["type"] == "user":
                 await process_command_prompt(req["prompt"])
+            elif req["type"] == "tts":
+                await process_voice_reply(req["text"])
             # elif req["type"] == "scheduled":
             #     await process_scheduled_task(req["task"])
-            # elif req["type"] == "tts":
-            #     await process_voice_reply(req["text"])
             else:
                 logger.warning(f"Unknown request type: {req.get('type')}")
         except Exception as e:
@@ -54,6 +54,7 @@ async def worker() -> None:
 
 
 async def get_command():
+    from components.tts_stt import tts_stt_toggle
     while True:
         user_request = await asyncio.to_thread(input, "User command: ")
         parsed = user_request.split(" ", 1)
@@ -61,12 +62,9 @@ async def get_command():
         parameters = parsed[1] if len(parsed) > 1 else None
 
         print("Got user command:", command, ", parameters:", parameters)
-        # if command == "/v":     # voice
-        #     if tts_stt_enabled:
-        #         tts_stt_disable(tts_context)
-        #     else:
-        #         tts_context = tts_stt_enable()
-        #     tts_stt_enabled = not tts_stt_enabled
+        if command == "/v":     # voice
+            tts_stt_toggle()
+
         if command == "/p":     # prompt
             if parameters:
                 await request_queue.put({"type": "user", "prompt": f"[Command prompt]: {parameters}"})
