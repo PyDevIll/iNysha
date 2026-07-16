@@ -10,14 +10,15 @@ import re
 import sys
 import asyncio
 
-def global_exception_handler(exc_type, exc_value, exc_traceback):
-    logger.exception("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
-
-sys.excepthook = global_exception_handler
+# def global_exception_handler(exc_type, exc_value, exc_traceback):
+#     logger.exception("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+#
+# sys.excepthook = global_exception_handler
 
 # auto-download incoming files to data/downloads/
 DOWNLOADS_DIR = Path(__file__).resolve().parent / "data" / "downloads"
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 request_queue = None  # will be set in main
 agent = None

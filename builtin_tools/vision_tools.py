@@ -3,6 +3,12 @@
 import base64
 import mimetypes
 import os
+from datetime import datetime
+import asyncio
+
+import mss
+import mss.tools
+from pathlib import Path
 
 import httpx
 from loguru import logger
@@ -16,25 +22,21 @@ def _get_env_or_raise(key: str) -> str:
         raise ValueError(f"Environment variable {key} is not set")
     return value
 
-
-async def _call_qwen_vl(image_url: str, query: str) -> str:
-    """Call the Qwen VL API with a prepared image URL."""
+# Add the multi-image API caller
+async def _call_qwen_vl_multi(image_urls: list[str], query: str) -> str:
+    """Call Qwen VL with multiple images (as data URLs)."""
     api_key = _get_env_or_raise("QWEN_API_KEY")
     endpoint = _get_env_or_raise("QWEN_API_ENDPOINT")
     chat_url = f"{endpoint}/chat/completions"
 
+    content = [{"type": "text", "text": query}]
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+
     payload = {
         "model": QWEN_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": query},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            }
-        ],
-        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 2048,  # adjust as needed
     }
 
     headers = {
@@ -49,11 +51,9 @@ async def _call_qwen_vl(image_url: str, query: str) -> str:
         choices = data.get("choices", [])
         if not choices:
             raise RuntimeError("No choices in Qwen VL response")
-
         content = choices[0].get("message", {}).get("content", "")
         if not content:
             raise RuntimeError("Empty content in Qwen VL response")
-
         return content
 
 
@@ -83,7 +83,7 @@ async def vision_analyze(image_path: str, query: str = "Опиши, что из�
     b64_str = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{b64_str}"
 
-    result = await _call_qwen_vl(data_url, query)
+    result = await _call_qwen_vl_multi([data_url], query)
     logger.debug(f"vision_analyze returned: {result}")
     return result
 
@@ -101,9 +101,108 @@ async def vision_analyze_url(image_url: str, query: str = "Опиши, что и
     """
     logger.debug(f"vision_analyze_url called with url={image_url}, query={query}")
 
-    result = await _call_qwen_vl(image_url, query)
+    result = await _call_qwen_vl_multi([image_url], query)
     logger.debug(f"vision_analyze_url returned: {result}")
     return result
+
+
+# ----- Making screenshots -----
+
+def _capture_screenshot_to_bytes(monitor: int = 1) -> bytes:
+    """
+    Capture a screenshot of the given monitor and return PNG bytes.
+    monitor: 1 = primary, 2 = secondary, etc. (0 = all monitors combined).
+    """
+    with mss.mss() as sct:
+        if monitor < 0 or monitor >= len(sct.monitors):
+            monitor = 1
+        img = sct.grab(sct.monitors[monitor])
+        return mss.tools.to_png(img.rgb, img.size)
+
+
+async def analyze_dynamic_scene(
+    monitor: int = 1,
+    interval_seconds: float = 0.5,
+    num_frames: int = 5,
+    query: str = "Опиши динамические изменения в этих последовательных кадрах. Дай детальный анализ того, что происходит в целом на русском языке."
+) -> str:
+    """
+    Capture multiple consecutive screenshots at a set interval and analyze them together.
+
+    Args:
+        monitor: Monitor index (1 = primary, 2 = secondary, etc.).
+        interval_seconds: Time between captures.
+        num_frames: Number of screenshots to capture.
+        query: Question to ask about the sequence.
+
+    Returns:
+        The model's textual description of the dynamic scene.
+    """
+    logger.debug(f"take_a_look: monitor={monitor}, interval={interval_seconds}, frames={num_frames}")
+
+    image_urls = []
+    for i in range(num_frames):
+        # Capture screenshot bytes
+        png_bytes = _capture_screenshot_to_bytes(monitor)
+        # Encode to base64 and create data URL
+        b64_str = base64.b64encode(png_bytes).decode("utf-8")
+        data_url = f"data:image/png;base64,{b64_str}"
+        image_urls.append(data_url)
+
+        # Wait before next capture (except after last)
+        if i < num_frames - 1:
+            await asyncio.sleep(interval_seconds)
+
+    # Send all images in one request
+    result = await _call_qwen_vl_multi(image_urls, query)
+    logger.debug(f"take_a_look result: {result}")
+    return result
+
+
+async def get_screenshot(monitor: int = 0) -> dict:
+    """
+    Capture a screenshot of the specified monitor and save it to /data.
+
+    Args:
+        monitor: Monitor index (0 = all monitors combined, 1 = primary, 2 = secondary, etc.).
+                 Default 0 captures the entire virtual screen.
+
+    Returns:
+        dict with keys:
+            ok (bool): Whether capture succeeded.
+            path (str): Path to the saved image (if ok).
+            file_size (int): Size of the saved file in bytes (if ok).
+            error (str): Error message if not ok.
+    """
+    from app import DATA_DIR
+    logger.debug(f"get_screenshot called with monitor={monitor}")
+
+    # Generate unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"screenshot_{timestamp}.png"
+    output_path = os.path.join(DATA_DIR, filename)
+
+    try:
+        with mss.mss() as sct:
+            # mss monitors: index 0 is the combined virtual screen, 1..N are physical monitors
+            # If the requested monitor index is out of range, fallback to 1 (primary)
+            if monitor < 0 or monitor >= len(sct.monitors):
+                logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors)-1}), using primary (1)")
+                monitor = 1
+
+            # Capture and save directly
+            sct.shot(mon=monitor, output=output_path)
+            logger.info(f"Screenshot saved to {output_path}")
+
+            file_size = os.path.getsize(output_path)
+            return {
+                "ok": True,
+                "path": output_path,
+                "file_size": file_size,
+            }
+    except Exception as e:
+        logger.error(f"Screenshot capture failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 TOOL_DEFINITIONS = [
@@ -147,6 +246,53 @@ TOOL_DEFINITIONS = [
             "required": ["image_url"],
         },
     ),
+    (
+        "get_screenshot",
+        get_screenshot,
+        "Capture a screenshot of a monitor and save it to /data",
+        {
+            "type": "object",
+            "properties": {
+                "monitor": {
+                    "type": "integer",
+                    "description": "Monitor index (0 = all monitors combined, 1 = primary, 2 = secondary, etc.)",
+                    "default": 0,
+                },
+            },
+            "required": [],
+        },
+    ),
+    (
+        "analyze_dynamic_scene",
+        analyze_dynamic_scene,
+        "Capture multiple screenshots at intervals and analyze the dynamic scene",
+        {
+            "type": "object",
+            "properties": {
+                "monitor": {
+                    "type": "integer",
+                    "description": "Monitor index (1 = primary, 2 = secondary, etc.)",
+                    "default": 1,
+                },
+                "interval_seconds": {
+                    "type": "number",
+                    "description": "Time between consecutive captures (seconds)",
+                    "default": 0.5,
+                },
+                "num_frames": {
+                    "type": "integer",
+                    "description": "Number of screenshots to capture",
+                    "default": 5,
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Question to ask about the sequence",
+                    "default": "Опиши динамические изменения в этих последовательных кадрах. Дай детальный анализ того, что происходит в целом на русском языке.",
+                },
+            },
+            "required": [],
+        },
+    )
 ]
 
 
