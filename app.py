@@ -73,7 +73,7 @@ async def get_command():
 
 # --------- APP ENTRY POINT -----------
 async def start_app():
-    from components.max import run_http_server
+    from components.max import run_http_server, max_deferred_reply
 
     # Configure logging
     logger.remove()
@@ -116,7 +116,7 @@ async def start_app():
         name="INYSHA",
         base_prompts=[
             ("## **IDENTITY**\n", "system_prompts/core.md"),
-            # ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),
+            ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),
             ("\n## **Tools Guidelines & Best Practices**\n", "system_prompts/tools_guidelines.md"),
         ],
         last_memory=[
@@ -131,9 +131,10 @@ async def start_app():
     logger.info("Starting worker, scheduler checker and http listening...")
     worker_task = asyncio.create_task(worker())
     # checker_task = asyncio.create_task(scheduler_checker())
+    deferred_reply_task = asyncio.create_task(max_deferred_reply())
     http_task = asyncio.create_task(run_http_server())
     command_task = asyncio.create_task(get_command())
 
 
     logger.info("All components started. Awaiting tasks...")
-    await asyncio.gather(worker_task, http_task, command_task)
+    await asyncio.gather(worker_task, deferred_reply_task, http_task, command_task)

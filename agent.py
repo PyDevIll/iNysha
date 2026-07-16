@@ -300,7 +300,7 @@ class Agent:
                 stream=False,
                 max_tokens=LLM_MAX_OUTPUT_TOKENS,
                 temperature=1.0,
-                extra_body={"thinking": {"type": "disabled"}}
+                # extra_body={"thinking": {"type": "disabled"}}
             )
         except Exception as e:
             logger.exception(f"LLM API call failed: {e}")

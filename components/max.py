@@ -1,13 +1,18 @@
 import os
 from loguru import logger
+import asyncio
 from fastapi import FastAPI, Request, BackgroundTasks
 import uvicorn
 from lib.max_bot import MAXBot
 from tool_registry import get_registry
 from app import get_agent, get_request_queue, DOWNLOADS_DIR
+from time import time
 
 
 fast_api_app = FastAPI()
+trusted_user_ids = [115302544, 5156907]
+trusted_chat_ids = [326963375, 367837204]
+DEFERRED_REPLY_TIME = 6    # seconds
 
 @fast_api_app.post("/max-webhook")
 async def max_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -41,9 +46,48 @@ bot = MAXBot(token=os.environ.get("MAX_BOT_TOKEN"), reasoning_chat_id=326963375)
 registry = get_registry()
 registry.set_bot(bot)
 
-# # File handler: auto-download incoming files to data/downloads/
-# DOWNLOADS_DIR = Path(__file__).resolve().parent / "data" / "downloads"
-# DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+max_chat_updates_queue = {}
+max_last_update_time = time()
+
+def enqueue_max_chat_update(chat_id, msg):
+    if chat_id in max_chat_updates_queue:
+        max_chat_updates_queue[chat_id].append(msg)
+    else:
+        max_chat_updates_queue[chat_id] = [msg]
+    global max_last_update_time
+    max_last_update_time = time()
+    print("Max message append to queue:", msg[:100])
+
+
+async def max_deferred_reply():
+    max_updates_list = []
+    while True:
+        await asyncio.sleep(1)
+        if len(max_chat_updates_queue.items()) > 0 and (time() - max_last_update_time) >= DEFERRED_REPLY_TIME:
+            # ---- Collect chat updates ----
+            max_updates_list.append("[MAX messenger]:")
+            for chat_id in max_chat_updates_queue:
+                max_updates_list.append(f"# chat_id: {chat_id}")
+                max_updates_list.append('\n'.join(max_chat_updates_queue[chat_id]))
+                max_updates_list.append('---\n')
+
+            cumulative_max_update = '\n'.join(max_updates_list)
+            print("Cumulative MAX update is sent to LLM:\n\n", cumulative_max_update)
+            max_updates_list.clear()
+            max_chat_updates_queue.clear()
+
+            async def reasoning_callback(thought: str) -> None:
+                await bot.send_reasoning(thought)
+
+            # ---- Запуск агента и отправка ответа ----
+            agent = get_agent()
+            response = await agent.run_with_crash_recovery(
+                initial_user_request=cumulative_max_update,
+                reasoning_callback=reasoning_callback,
+            )
+
+            if response:
+                await bot.send_reasoning(response)
 
 
 # ---- Actual processing logic for user messages ----
@@ -140,10 +184,10 @@ async def process_max_message(update: dict) -> None:
     sender_name = sender.get('name') or sender.get('first_name', '')
     user_id = sender.get('user_id')
 
+    # is_trusted = (chat_id in trusted_chat_ids) or (user_id in trusted_user_ids)
+
     # ---- 6. Построение контекста ----
-    context_parts = [
-        f"Current chat_id: {chat_id}",
-    ]
+    context_parts = [f"Current chat_id: {chat_id}"]
     if user_id:
         sender_str = f"User: {user_id}"
         if sender_name:
@@ -154,20 +198,10 @@ async def process_max_message(update: dict) -> None:
         context_parts.append(f"Downloaded files: {', '.join(downloaded_files)}")
     context_parts.append(f"Content: {text}")
 
-    context_str = "\n".join(context_parts)
-    enhanced_request = f"{context_str}\n\nUser request: {text}"
+    enhanced_request = "\n".join(context_parts)
+    # enhanced_request = f"{context_str}\n\nUser request: {text}"
 
     logger.info(f"MAX update in chat {chat_id}: {text[:100]}")
 
-    async def reasoning_callback(thought: str) -> None:
-        await bot.send_reasoning(thought)
-
-    # ---- 7. Запуск агента и отправка ответа ----
-    agent = get_agent()
-    response = await agent.run_with_crash_recovery(
-        initial_user_request=enhanced_request,
-        reasoning_callback=reasoning_callback,
-    )
-
-    if response:
-        await bot.send_reply(chat_id, response)
+    # Enqueue update for deferred reply
+    enqueue_max_chat_update(chat_id, enhanced_request)

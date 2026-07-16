@@ -9,21 +9,31 @@ C:\Users\delph\PycharmProjects\iNysha\
 
 | # | File                                 | Role |
 |---|--------------------------------------|------|
-| * | `main.py`                            | Entry point. Initializes registry→Agent→TelegramBot→polling loop |
+| * | `main.py`                            | Entry point. Loads .env, starts app, runs asyncio loop |
 | * | `agent.py`                           | Async agent loop: builds system prompt, calls LLM, executes tools, manages history |
 | * | `tool_registry.py`                   | `ToolRegistry` singleton: register, execute, hot-reload, export to LLM-compatible JSON schema |
 | * | `context_manager.py`                 | `ContextPool v3`: 4-layer memory (scratchpad→sliding→masked→compressed), token budget, crash recovery |
-| * | `max_bot.py`                         | `TelegramBot`: async polling, reasoning-to-separate-chat, file download/upload |
+| * | `lib/max_bot.py`                     | `MAXBot`: async long polling, reasoning-to-separate-chat, file download/upload |
+| * | `lib/scheduler.py`                   | In‑process task scheduler with JSON persistence. Manages delayed LLM self‑calls |
+| * | `lib/tts_rest_services.py`           | Low‑level TTS (Yandex) and STT (VAD + Yandex) for local microphone |
 | * | `system_prompts/core.md`             | IDENTITY block: agent name, goal, language, environment, timestamp |
 | * | `system_prompts/tools_guidelines.md` | Available Tools block: tool schemas injected dynamically by the registry |
 | * | `system_prompts/extended.md`         | **THIS FILE** — CAPABILITIES, RULES, ARCHITECTURE, tool addition procedure |
-| * | `builtin_tools/__init__.py`          | `register_builtin_tools(registry)`: calls `register_all()` on each tool module |
+| * | `builtin_tools/__init__.py`          | `register_all(registry)`: calls `register_all()` on each tool module |
 | * | `builtin_tools/fs_tools.py`          | File system tools: tree, read, stat, grep, find, mkdir, touch, rm, mv, cp, cd, pwd, sizes |
 | * | `builtin_tools/edit_tools.py`        | Advanced file editing: fs_aedit, fs_edit_blocks, fs_apply_patch, fs_write_file, fs_edit, fs_append |
-| * | `builtin_tools/git_tools.py`         | Git operations: init, status, add, commit, log, diff, branch, checkout |
+| * | `builtin_tools/git_tools.py`         | Git operations: status, log, diff |
 | * | `builtin_tools/tavily_tools.py`      | Tavily search + browse (deeper extraction) |
-| * | `builtin_tools/tts_tools.py`         | Google TTS: tts_generate, telegram_send_voice |
-| * | `builtin_tools/meta_tools.py`        | Self-management: reload_tools (hot-reloads all tool modules + re-registers) |
+| * | `builtin_tools/tts_tools.py`         | Google TTS (tts_generate) + Yandex SpeechKit STT (yandex_transcribe) |
+| * | `builtin_tools/meta_tools.py`        | Self‑management: reload_tools (hot‑reloads all tool modules + re‑registers), ping |
+| * | `builtin_tools/additional_tools.py`  | exec_python, exec_shell, schedule_task, list_scheduled_tasks, cancel_scheduled_task |
+| * | `builtin_tools/max_tools.py`         | MAX Messenger tools: max_send_file, max_download_file, max_send_voice, max_send_message, max_get_messages |
+| * | `builtin_tools/rest_api_tool.py`     | Universal REST API caller (rest_api_call) |
+| * | `builtin_tools/vision_tools.py`      | Qwen VL vision analysis: vision_analyze (local file), vision_analyze_url (URL) |
+| * | `components/cmd_line.py`             | Processes command‑prompt input (stdin) via agent |
+| * | `components/max.py`                  | FastAPI webhook receiver for MAX updates, deferred reply logic, message processing |
+| * | `components/schedule.py`             | Processes due scheduled tasks (runs agent with the stored prompt) |
+| * | `components/tts_stt.py`              | TTS‑STT dialogue loop: local microphone input → LLM → TTS output |
 
 
 ### Tool execution flow
@@ -128,7 +138,7 @@ ToolRegistry.list_tools()        # Returns dict of {name: description}
 - **Web**: Tavily search and browse URL for deeper extraction.
 - **Tools**: Hot-reload tool system via `reload_tools`. New tools loaded without restart.
 - **Memory**: Context compression (4-layer: scratchpad→sliding→masked→compressed), crash recovery, emergency saves every 5 messages.
-- **MAX messenger**: Responds to each incoming message. Reasoning output to separate chat. File transfer via `max_send_file` (FS→messenger) and `max_download_file` (Messenger→FS). Incoming documents/photos auto-download to `data/downloads/`.
+- **MAX messenger**: Responds to each chat that has updates. Reasoning output to separate chat. File transfer via `max_send_file` (FS→messenger) and `max_download_file` (Messenger→FS). Incoming documents/photos auto-download to `data/downloads/`.
 - **Voice**: Yandex STT transcription (russian), Google TTS voice generation, MAX messenger voice message send/receive.
 - **Git**: Observation of local repository — status, log, diff.
 
@@ -140,3 +150,10 @@ ToolRegistry.list_tools()        # Returns dict of {name: description}
 - **Self-learning**: After every significant interaction, consider whether something was learned about the system's overall functioning that should be persisted in this file. Update `data\persistent_memory.json` proactively with learned lessons, new operational knowledge, discovered capabilities, or refined rules.
 - **Verify via Git after edits**: After any file modification, verify correctness using `git diff` (what changed) and `git status` (untracked/modified tracking). Do NOT re-read the file with `fs_read` for verification — git tools are faster, show exactly what was inserted/removed, and confirm that untracked artifacts are properly ignored. Fall back to `fs_read` only when the repository is uninitialized and git tools are unavailable.
 - **On an unexpected tool result**: Immediately stop, create an error report and acknowledge the inability to use the tool.
+
+## **MAX bundled updates**
+- Updates from MAX are received as a bundle of messages, collected from several chats over a period of `DEFERRED_REPLY_TIME` seconds (6) from the last update.
+- Some chats may not require your participation. (e.g., users talking to each other, or a purely technical update like `message_removed` with no text or attachment)
+- Craft separate replies or plan a corresponding tool calls for each `chat_id` that needs your action.
+- Process the incoming update for each `chat_id` accordingly (e.g., `max_send_message` with the correct `chat_id` or other relevant tool calls)
+- As the final message, report on what has been done.

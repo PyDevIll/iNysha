@@ -13,15 +13,14 @@ from typing import Optional, Callable, Awaitable, Any, Dict, List, Union
 
 import httpx
 from loguru import logger
+import hashlib
+import mimetypes
 
 # ---------- Constants ----------
 MAX_API_URL = "https://platform-api2.max.ru"
 MAX_API_VERSION = "v1"
-LONG_POLL_TIMEOUT = 60
 RETRY_INTERVAL = 5  # seconds
 
-import hashlib
-import mimetypes
 
 def _safe_filename_from_token(token: str, content_type: str = "") -> str:
     """
