@@ -63,9 +63,33 @@ async def max_deferred_reply():
     max_updates_list = []
     while True:
         await asyncio.sleep(1)
-        if len(max_chat_updates_queue.items()) > 0 and (time() - max_last_update_time) >= DEFERRED_REPLY_TIME:
+        if (time() - max_last_update_time) < DEFERRED_REPLY_TIME:
+            continue
+
+            # ----- Single chat reply -----
+        if len(max_chat_updates_queue.items()) == 1:
+            async def reasoning_callback(thought: str) -> None:
+                await bot.send_reasoning(thought)
+
+            chat_id = list(max_chat_updates_queue.keys())[0]
+            msg_list = list(max_chat_updates_queue.values())[0]
+            single_max_update = "[MAX messenger]:" + '\n'.join(msg_list)
+            max_chat_updates_queue.clear()
+            print("Send single MAX chat update to LLM", single_max_update)
+
+            agent = get_agent()
+            response = await agent.run_with_crash_recovery(
+                initial_user_request=single_max_update,
+                reasoning_callback=reasoning_callback,
+            )
+
+            if response:
+                await bot.send_reply(chat_id, response)
+
+        # ----- Multiple chat reply -----
+        elif len(max_chat_updates_queue.items()) > 1:
             # ---- Collect chat updates ----
-            max_updates_list.append("[MAX messenger]:")
+            max_updates_list.append("[MAX messenger][Bundled update]:")
             for chat_id in max_chat_updates_queue:
                 max_updates_list.append(f"# chat_id: {chat_id}")
                 max_updates_list.append('\n'.join(max_chat_updates_queue[chat_id]))

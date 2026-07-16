@@ -152,8 +152,9 @@ ToolRegistry.list_tools()        # Returns dict of {name: description}
 - **On an unexpected tool result**: Immediately stop, create an error report and acknowledge the inability to use the tool.
 
 ## **MAX bundled updates**
+Actual only for `[Bundled update]` events.
 - Updates from MAX are received as a bundle of messages, collected from several chats over a period of `DEFERRED_REPLY_TIME` seconds (6) from the last update.
 - Some chats may not require your participation. (e.g., users talking to each other, or a purely technical update like `message_removed` with no text or attachment)
 - Craft separate replies or plan a corresponding tool calls for each `chat_id` that needs your action.
 - Process the incoming update for each `chat_id` accordingly (e.g., `max_send_message` with the correct `chat_id` or other relevant tool calls)
-- As the final message, report on what has been done.
+- As the final message, report on what has been done in super-short form.
