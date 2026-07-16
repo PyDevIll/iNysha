@@ -335,7 +335,7 @@ class Agent:
                 "role": "user",
                 "name": "User",
                 "content": initial_user_request,
-            })
+            }, save=True)
 
         # Proactive compression: if context overflowed before LLM call, compress now
         if self.messages.overflow and self._helper_agent:
@@ -405,7 +405,7 @@ class Agent:
                 )
 
                 for result in tool_results:
-                    self.messages.append(result, save=False)
+                    self.messages.append(result, save=True)
 
                 # Check if context overflowed — trigger compression
                 if self.messages.overflow and self._helper_agent:

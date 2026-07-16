@@ -15,6 +15,7 @@ import httpx
 from loguru import logger
 import hashlib
 import mimetypes
+import urllib.parse
 
 # ---------- Constants ----------
 MAX_API_URL = "https://platform-api2.max.ru"
@@ -724,7 +725,7 @@ class MAXBot:
                 if content_disposition and "filename=" in content_disposition:
                     match = re.search(r'filename["\s]*=[\s]*"?([^"]+)"?', content_disposition)
                     if match:
-                        filename = match.group(1)
+                        filename = urllib.parse.unquote(match.group(1))
                     else:
                         content_type = response.headers.get("content-type", "")
                         filename = _safe_filename_from_token(file_token, content_type)
@@ -761,7 +762,7 @@ class MAXBot:
                 if content_disposition and "filename=" in content_disposition:
                     match = re.search(r'filename["\s]*=[\s]*"?([^"]+)"?', content_disposition)
                     if match:
-                        filename = match.group(1)
+                        filename = urllib.parse.unquote(match.group(1))
                     else:
                         content_type = response.headers.get("content-type", "")
                         filename = _safe_filename_from_token(file_token, content_type)
