@@ -264,4 +264,4 @@ def stt_stop():
     stt_audio_queue.clear()
 
 
-atexit.register(audio.terminate())
+atexit.register(audio.terminate)

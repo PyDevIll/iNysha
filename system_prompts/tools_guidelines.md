@@ -71,10 +71,11 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 
 ### Text‑to‑Speech & Transcription (`tts_*`, `yandex_transcribe`)
 
-| Tool | Rating | Notes |
-|------|--------|-------|
-| `tts_generate` | ★★★★★ | Generates MP3 audio from text using Google Translate TTS. **Completely free**, no API key required. Max 200 characters. Supports 50+ languages. Used internally by `max_send_voice`. |
+| Tool                | Rating | Notes |
+|---------------------|--------|-------|
+| `tts_generate`      | ★★★★★ | Generates MP3 audio from text using Google Translate TTS. **Completely free**, no API key required. Max 200 characters. Supports 50+ languages. Used internally by `max_send_voice`. |
 | `yandex_transcribe` | ★★★★★ | **Transcribe audio to text** using Yandex SpeechKit STT Supports OGG/MP3/WAV/any format. **Two modes:** (1) `audio_path` — local file on disk; (2) `url` — public URL, downloads in memory, no disk write. Optional `lang` (default: ru-RU) and `topic` (default: general)
+| `tts_speak_aloud`   | ★★★★★ | Speaks synthesized speech from real-world speakers. 200 chars max. Russian only.
 
 ---
 
@@ -146,9 +147,18 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 **Git:** use `git_diff` to review changes.
 **New tools:** after adding any new tool module, immediately call `reload_tools` to make it available.
 **Aider workflow:** identify the need → formulate precise instruction → list target files → call `aider_run`. Always verify changes with `git_diff` afterward. Do not use Aider for single‑file trivial edits — `fs_aedit`/`fs_edit_blocks` are faster.
-**Audio / Transcription:** use `yandex_transcribe` for transcribing voice messages (OGG/MP3/WAV). Use `url` mode for CDN links (no disk write) or `audio_path` for local files.
+**Audio / Transcription:** 
+    `[MAX messenger]`:
+        - Use `yandex_transcribe` for transcribing voice messages (OGG/MP3/WAV). Use `url` mode for CDN links (no disk write) or `audio_path` for local files.
+    `[Local mic]`: 
+        - Use `tts_speak_aloud` at any time: during reasoning and as replies to `[Local mic]` messages.
+        - Your replies to `[Local mic]` messages are meant to be spoken by TTS-engine, so craft your replies on such messages accordingly.
+        - Reply in-character as if you are speaking. No emojis, no descriptions and interludes - only spoken words.
+        - Please, be **short**, when using `tts_speak_aloud` tool! .
+
 **Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL-based images, `analyze_dynamic_scene` to capture the screen in motion. Supported formats: JPEG, PNG, GIF, WEBP. Powered by Qwen VL (`qwen3-vl-plus`).
-    Ask a specific question in the `query` parameter, based on the context of the interaction, about what you expect to see in the given visual content. 
+    - Ask a specific question in the `query` parameter, based on the context of the interaction, about what you expect to see in the given visual content. 
+
 **Scheduler:** use `schedule_task` for periodic/autonomous tasks. Tasks fire on the next user message after `delay_minutes`. Cancel with `cancel_scheduled_task`.
 **MAX Messenger specifics:**
     - **Always obtain `chat_id`** from the user's message context (shown as `Current chat_id: ...`). Do not guess or hardcode chat IDs unless explicitly provided.
@@ -158,6 +168,7 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
     - **When a user sends a file**, the agent will see a `file_token` in the update. `max_download_file` may return 404 — use a Python script with the CDN URL as workaround.
     - **Remember that `chat_id` is a numeric string** (e.g., `"123456789"`) — pass it as a string in the tool call, and the tool will convert it to integer internally.
     - **Stickers:** to send a sticker, use `rest_api_call` with `method=POST`, endpoint `/messages?chat_id=X`, body `{"attachments": [{"type": "sticker", "payload": {"code": "..."}}]}` (no `text` field — sending sticker with text returns 400).
+
 **Shell execution specifics:**
     To avoid common pitfalls, follow these guidelines when constructing the `command` argument:
         - **Use raw strings for complex commands** – avoid escaping backslashes; pass the command exactly as you would type it in `cmd.exe`.

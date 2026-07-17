@@ -222,6 +222,25 @@ async def tts_generate(
     return await _tts_google(text=text, lang=lang, speed=speed, output_dir=output_dir)
 
 
+async def tts_speak_aloud(text: str):
+    """Speak aloud from physical PC audio-system with Yandex TTS Synthesis
+    Args:
+        text: Text to speak (max 200 chars, Russian only)
+
+    Returns:
+        dict: {\"ok\": True} on success
+    """
+    from lib.tts_rest_services import tts_speak
+    from components.tts_stt import tts_stt_enabled
+    if not tts_stt_enabled:
+        return {"ok": False, "error": "TTS is not enabled. You cannot use this tool now!"}
+
+    await tts_speak(text)
+    return {
+        "ok": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -284,4 +303,19 @@ def register_all(registry) -> None:
             "required": [],  # at least one of audio_path or url must be provided (validated in function)
         },
     )
-    logger.info("TTS/STT tools registered: tts_generate, yandex_transcribe")
+    registry.register_function(
+        func=tts_speak_aloud,
+        name="tts_speak_aloud",
+        description="Speak aloud from physical PC audio-system with Yandex TTS Synthesis",
+        parameters={
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to speak (max 200 chars, Russian only)",
+                },
+            },
+            "required": ["text"],
+        },
+    )
+    logger.info("TTS/STT tools registered: tts_generate, yandex_transcribe, tts_speak_aloud")
