@@ -13,7 +13,8 @@ import atexit
 
 TTS_RATE = 48000
 STT_RATE = 8000
-STT_LISTEN_TIME = 4     # seconds between spoken phrases
+STT_LISTEN_TIME = 3     # seconds between spoken phrases
+STT_MAX_AUDIO_QUEUE_LEN = 10
 
 stt_audio_queue = []
 stt_last_request_time = time()
@@ -242,7 +243,7 @@ async def stt_transcriber():
     while True:
         await asyncio.sleep(1)
         if len(stt_audio_queue) > 0:
-            if  (time() - stt_last_request_time) >= STT_LISTEN_TIME:
+            if  ((time() - stt_last_request_time) >= STT_LISTEN_TIME) or (len(stt_audio_queue) > STT_MAX_AUDIO_QUEUE_LEN):
                 print('Send collected audio for transcription')
                 audio_bytes = b''.join(stt_audio_queue)
                 stt_audio_queue.clear()

@@ -21,7 +21,7 @@ async def input_from_mic():
         async for next_phrase in stt_transcriber():
             if next_phrase:
                 request_queue = get_request_queue()
-                await request_queue.put({"type": "tts", "text": next_phrase})
+                await request_queue.put({"type": "tts", "text": "[Local mic]: " + next_phrase})
 
     except asyncio.CancelledError:
         print("Mic listening task cancelled")
@@ -33,13 +33,13 @@ async def input_from_mic():
 
 
 def tts_stt_toggle():
-    global tts_stt_enabled
+    global tts_stt_enabled, stt_listen_task
     tts_stt_enabled = not tts_stt_enabled
     if tts_stt_enabled:
         stt_start()
         stt_listen_task = asyncio.create_task(input_from_mic())
     else:
-        sst_listen_task.cancel()
+        stt_listen_task.cancel()
         stt_stop()
 
 
@@ -61,13 +61,13 @@ def _sanitize_for_tts(text: str) -> str:
 
 
 async def process_voice_input(text):
-    async def reasoning_callback(thought):
-        print(" > ...", thought)
+    # async def reasoning_callback(thought):
+    #     print(" > ...", thought)
 
     agent = get_agent()
     response_text = await agent.run_with_crash_recovery(
-        initial_user_request=text,
-        reasoning_callback=reasoning_callback,
+        initial_user_request=text
+        # reasoning_callback=reasoning_callback,
     )
 
     if response_text:

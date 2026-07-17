@@ -278,7 +278,7 @@ class Agent:
 
         return fixed_messages
 
-    async def llm_request(self) -> dict:
+    async def llm_request(self, enable_reasoning) -> dict:
         """Make an async LLM API call with layered context."""
         messages = self._build_messages_for_llm()
 
@@ -300,7 +300,7 @@ class Agent:
                 stream=False,
                 max_tokens=LLM_MAX_OUTPUT_TOKENS,
                 temperature=1.0,
-                # extra_body={"thinking": {"type": "disabled"}}
+                extra_body={"thinking": {"type": "enabled"} if enable_reasoning else {"type": "disabled"}}
             )
         except Exception as e:
             logger.exception(f"LLM API call failed: {e}")
@@ -328,6 +328,7 @@ class Agent:
         """
         max_iterations = 7
         iteration = 0
+        enable_reasoning = bool(reasoning_callback)
 
         # Add user message to context
         if initial_user_request:
@@ -362,7 +363,7 @@ class Agent:
                 logger.debug(f"Registry v{registry.version}, {len(registry.tool_names)} tools ready")
 
             try:
-                response = await self.llm_request()
+                response = await self.llm_request(enable_reasoning)
             except Exception as e:
                 logger.exception(f"LLM request failed at iteration {iteration}")
                 self.messages.log_state("FAILED LLM REQUEST")

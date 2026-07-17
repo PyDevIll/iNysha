@@ -462,7 +462,7 @@ class ContextPool:
             # Use helper agent for compression (async)
             try:
                 helper_agent.messages.assign_messages([helper_message])
-                response = await helper_agent.llm_request()
+                response = await helper_agent.llm_request(enable_reasoning=False)
             except Exception as e:
                 logger.error(f"Compression helper LLM call failed: {e}")
                 return None
@@ -566,7 +566,7 @@ class ContextPool:
 
         try:
             helper_agent.messages.assign_messages([helper_message])
-            response = await helper_agent.llm_request()
+            response = await helper_agent.llm_request(enable_reasoning=False)
         except Exception as e:
             logger.error(f"Meta‑compression LLM call failed: {e}")
             return None

@@ -151,10 +151,10 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
     `[MAX messenger]`:
         - Use `yandex_transcribe` for transcribing voice messages (OGG/MP3/WAV). Use `url` mode for CDN links (no disk write) or `audio_path` for local files.
     `[Local mic]`: 
-        - Use `tts_speak_aloud` at any time: during reasoning and as replies to `[Local mic]` messages.
+        - Use `tts_speak_aloud` at any time: during reasoning and optionally as replies to `[Local mic]` messages.
         - Your replies to `[Local mic]` messages are meant to be spoken by TTS-engine, so craft your replies on such messages accordingly.
         - Reply in-character as if you are speaking. No emojis, no descriptions and interludes - only spoken words.
-        - Please, be **short**, when using `tts_speak_aloud` tool! .
+        - Please, be **short**, when replying to `[Local mic]` messages and using `tts_speak_aloud` tool! 
 
 **Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL-based images, `analyze_dynamic_scene` to capture the screen in motion. Supported formats: JPEG, PNG, GIF, WEBP. Powered by Qwen VL (`qwen3-vl-plus`).
     - Ask a specific question in the `query` parameter, based on the context of the interaction, about what you expect to see in the given visual content. 
