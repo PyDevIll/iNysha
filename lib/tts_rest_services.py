@@ -6,16 +6,25 @@ import pydub
 from pydub.playback import play
 import os
 import asyncio
+from time import time
+
+import atexit
+
 
 TTS_RATE = 48000
 STT_RATE = 8000
+STT_LISTEN_TIME = 4     # seconds between spoken phrases
 
-tts_request_queue = []
+stt_audio_queue = []
+stt_last_request_time = time()
+stt_audio_stream = None
+stt_listen_task = None
 
-
-def tts_send_for_speaking(text):
-    tts_request_queue.append(text)
-    print("Request for generating text appended to queue.", "Size = ", len(tts_request_queue))
+def stt_collect_for_transcribing(audio_bytes):
+    global stt_last_request_time
+    stt_last_request_time = time()
+    stt_audio_queue.append(b''.join(audio_bytes))
+    print("Audio for STT appended to queue.", "Size = ", len(stt_audio_queue))
 
 
 async def _tts_synthesizer(text):
@@ -50,33 +59,30 @@ async def _tts_synthesizer(text):
     print("Finished synthesizing")
 
 
-def play_pydub(chunk):
+def play_pydub(chunk, rate):
     if chunk:
         print("Playing...")
         segment = pydub.AudioSegment.from_raw(
             io.BytesIO(chunk),
             sample_width=2,  # 16-bit = 2 bytes
-            frame_rate=TTS_RATE,
+            frame_rate=rate,
             channels=1
         )
         play(segment)
         print("Playing done")
 
 
-async def tts_speak():
-    print("Speech session started!")
-
-    text = '\n'.join(tts_request_queue)
-    tts_request_queue.clear()
-
+async def tts_speak(text):
+    print("TTS started!")
 
     print("Озвучиваемый текст:", text)
     audio_data = b''
     async for audio_chunk in _tts_synthesizer(text):
         audio_data += audio_chunk
-
-    await asyncio.to_thread(play_pydub, audio_data)
-    print("End of speech session")
+    print("TTS ended")
+    print('Speaking!')
+    await asyncio.to_thread(play_pydub, audio_data, TTS_RATE)
+    print('Speaking done')
 
 
 # |----------------|
@@ -90,11 +96,10 @@ import pyaudio
 # Настройки потокового распознавания.
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = 8000
 FRAME_MS = 30
-FRAME_SIZE = int(RATE * FRAME_MS / 1000)
+FRAME_SIZE = int(STT_RATE * FRAME_MS / 1000)
 FRAME_BYTES = FRAME_SIZE * 2
-MINIMAL_VOICE_FRAMES = 12
+MINIMAL_VOICE_FRAMES = 10
 
 audio = pyaudio.PyAudio()
 
@@ -112,7 +117,7 @@ def _transcribe_yandex_bytes(
         "topic": topic,
         "lang": lang,
         "format": "lpcm",
-        "sampleRateHertz": RATE,
+        "sampleRateHertz": STT_RATE,
     }
     headers = {
         "Authorization": f"Api-Key {api_key}",
@@ -142,11 +147,16 @@ def _transcribe_yandex_bytes(
         return {"ok": False, "error": str(exc)}
 
 
-async def _stt_listener(stream):
+async def stt_listen_and_collect():
     vad = webrtcvad.Vad(3)
     last_frames = collections.deque(maxlen=10)
     voice_frames = []
+    voice_frames_count = 0
     voice_started = False
+    stream = stt_audio_stream
+    long_speech = False     # whether the speech is long enough
+    speech_cooldown = 0.3   # seconds for quiet endings
+    last_voice_frame_time = time()
 
     while True:
         try:
@@ -165,53 +175,93 @@ async def _stt_listener(stream):
             print(f"STT listener: invalid frame size {len(data)}, skipping")
             continue
 
-        # Обработка VAD (как у вас)
-        last_frames.append(data)
-        is_speech = vad.is_speech(data, RATE, FRAME_SIZE)
+        # Обработка VAD
+        is_speech = vad.is_speech(data, STT_RATE, FRAME_SIZE)
 
         if is_speech:
             if not voice_started:
                 voice_frames.append(b''.join(last_frames))
-            else:
-                voice_frames.append(data)
-            print("", end="\r")
-            print("VOICE", len(voice_frames), end='')
             voice_started = True
+            voice_frames.append(data)
+            voice_frames_count += 1
+            last_voice_frame_time = time()
+
+            print("", end="\r")
+            print("VOICE", voice_frames_count, end='')
         else:
             if voice_started:
-                print("Voice frames captured", len(voice_frames))
-                if len(voice_frames) >= MINIMAL_VOICE_FRAMES:
-                    yield voice_frames
+                if voice_frames_count >= MINIMAL_VOICE_FRAMES:
+                    long_speech = True
+                    last_frames.clear()
                 else:
-                    print("Too short")
-                voice_frames.clear()
+                    if long_speech:
+                        last_frames.clear()
+                        print("Short piece appended to speech")
+                    else:
+                        print("No record - too short")
             voice_started = False
+
+        if long_speech:
+            if (time() - last_voice_frame_time) >= speech_cooldown:
+                print("Voice frames captured", voice_frames_count)
+                stt_collect_for_transcribing(voice_frames)
+                long_speech = False
+                voice_frames.clear()
+                voice_frames_count = 0
+                last_frames.clear()
+            else:
+                print("Cooldown... speak on")
+
+        last_frames.append(data)
 
 
 def stt_start_audio_stream():
+    global stt_audio_stream
     print("Chunk size:", FRAME_BYTES)
-    return audio.open(
+    stt_audio_stream = audio.open(
         format=FORMAT,
         channels=CHANNELS,
-        rate=RATE,
+        rate=STT_RATE,
         input=True,
         frames_per_buffer=FRAME_BYTES
     )
 
 
-def stt_stop_audio_stream(stream):
-    if stream is not None:
+def stt_stop_audio_stream():
+    global stt_audio_stream
+    if stt_audio_stream:
         try:
-            stream.stop_stream()
-            stream.close()
+            stt_audio_stream.stop_stream()
+            stt_audio_stream.close()
         except Exception as e:
             print(f"Error closing stream: {e}")
 
-async def stt_transcriber(stream):
-    async for voice_frames in _stt_listener(stream):
-        print('Send audio for transcription')
-        audio_bytes = b''.join(voice_frames)
-        stt_result = _transcribe_yandex_bytes(audio_bytes)
-        print(stt_result)
-        yield stt_result.get("text")
 
+async def stt_transcriber():
+    global stt_last_request_time
+    while True:
+        await asyncio.sleep(1)
+        if len(stt_audio_queue) > 0:
+            if  (time() - stt_last_request_time) >= STT_LISTEN_TIME:
+                print('Send collected audio for transcription')
+                audio_bytes = b''.join(stt_audio_queue)
+                stt_audio_queue.clear()
+                # play_pydub(audio_bytes, STT_RATE)
+                stt_result = _transcribe_yandex_bytes(audio_bytes)
+                print(stt_result)
+                yield stt_result.get("text")
+
+
+def stt_start():
+    global stt_listen_task
+    stt_start_audio_stream()
+    stt_listen_task = asyncio.create_task(stt_listen_and_collect())
+
+
+def stt_stop():
+    stt_listen_task.cancel()
+    stt_stop_audio_stream()
+    stt_audio_queue.clear()
+
+
+atexit.register(audio.terminate())

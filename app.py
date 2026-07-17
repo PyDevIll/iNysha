@@ -33,7 +33,7 @@ def get_agent():
 async def worker() -> None:
     from components.max import process_max_message
     from components.cmd_line import process_command_prompt
-    from components.tts_stt import process_voice_reply
+    from components.tts_stt import process_voice_input
     while True:
         req = await request_queue.get()
         try:
@@ -42,7 +42,7 @@ async def worker() -> None:
             elif req["type"] == "user":
                 await process_command_prompt(req["prompt"])
             elif req["type"] == "tts":
-                await process_voice_reply(req["text"])
+                await process_voice_input(req["text"])
             # elif req["type"] == "scheduled":
             #     await process_scheduled_task(req["task"])
             else:
