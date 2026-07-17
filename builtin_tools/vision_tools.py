@@ -12,9 +12,10 @@ from pathlib import Path
 
 import httpx
 from loguru import logger
+import atexit
 
 QWEN_MODEL = "qwen3-vl-plus"
-
+_mss_instance = None
 
 def _get_env_or_raise(key: str) -> str:
     value = os.environ.get(key)
@@ -108,16 +109,22 @@ async def vision_analyze_url(image_url: str, query: str = "Опиши, что и
 
 # ----- Making screenshots -----
 
+def get_mss():
+    global _mss_instance
+    if not _mss_instance:
+        _mss_instance = mss.mss()
+    return _mss_instance
+
 def _capture_screenshot_to_bytes(monitor: int = 1) -> bytes:
     """
     Capture a screenshot of the given monitor and return PNG bytes.
     monitor: 1 = primary, 2 = secondary, etc. (0 = all monitors combined).
     """
-    with mss.mss() as sct:
-        if monitor < 0 or monitor >= len(sct.monitors):
-            monitor = 1
-        img = sct.grab(sct.monitors[monitor])
-        return mss.tools.to_png(img.rgb, img.size)
+    sct = get_mss()
+    if monitor < 0 or monitor >= len(sct.monitors):
+        monitor = 1
+    img = sct.grab(sct.monitors[monitor])
+    return mss.tools.to_png(img.rgb, img.size)
 
 
 async def analyze_dynamic_scene(
@@ -138,7 +145,7 @@ async def analyze_dynamic_scene(
     Returns:
         The model's textual description of the dynamic scene.
     """
-    logger.debug(f"take_a_look: monitor={monitor}, interval={interval_seconds}, frames={num_frames}")
+    logger.debug(f"analyze_dynamic_scene: monitor={monitor}, interval={interval_seconds}, frames={num_frames}")
 
     image_urls = []
     for i in range(num_frames):
@@ -180,29 +187,38 @@ async def get_screenshot(monitor: int = 0) -> dict:
     # Generate unique filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"screenshot_{timestamp}.png"
-    output_path = os.path.join(DATA_DIR, filename)
+    output_path = os.path.join(DATA_DIR / "screenshots", filename)
 
     try:
-        with mss.mss() as sct:
-            # mss monitors: index 0 is the combined virtual screen, 1..N are physical monitors
-            # If the requested monitor index is out of range, fallback to 1 (primary)
-            if monitor < 0 or monitor >= len(sct.monitors):
-                logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors)-1}), using primary (1)")
-                monitor = 1
+        sct = get_mss()
+        # mss monitors: index 0 is the combined virtual screen, 1..N are physical monitors
+        # If the requested monitor index is out of range, fallback to 1 (primary)
+        if monitor < 0 or monitor >= len(sct.monitors):
+            logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors)-1}), using primary (1)")
+            monitor = 1
 
-            # Capture and save directly
-            sct.shot(mon=monitor, output=output_path)
-            logger.info(f"Screenshot saved to {output_path}")
+        # Capture and save directly
+        sct.shot(mon=monitor, output=output_path)
+        logger.info(f"Screenshot saved to {output_path}")
 
-            file_size = os.path.getsize(output_path)
-            return {
-                "ok": True,
-                "path": output_path,
-                "file_size": file_size,
-            }
+        file_size = os.path.getsize(output_path)
+        return {
+            "ok": True,
+            "path": output_path,
+            "file_size": file_size,
+        }
     except Exception as e:
         logger.error(f"Screenshot capture failed: {e}")
         return {"ok": False, "error": str(e)}
+
+
+def cleanup_mss():
+    global _mss_instance
+    if _mss_instance is not None:
+        _mss_instance.close()
+        _mss_instance = None
+
+atexit.register(cleanup_mss)
 
 
 TOOL_DEFINITIONS = [
