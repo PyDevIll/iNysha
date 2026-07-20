@@ -28,17 +28,23 @@ def stt_collect_for_transcribing(audio_bytes):
     print("Audio for STT appended to queue.", "Size = ", len(stt_audio_queue))
 
 
-async def _tts_synthesizer(text):
+async def _tts_synthesizer(
+        text: str,
+        lang: str = 'ru-RU',
+        speed: float = 1.2,
+        format: str = 'lpcm',
+
+    ):
     api_key = os.environ.get("YANDEX_SPEECH_API_KEY", "")
     url = 'https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize'
     data = {
         'text': text,
-        'lang': 'ru-RU',
+        'lang': lang,
         'voice': 'jane', #'marina' 'friendly', 'alena', 'good'
         'emotion': 'evil',
-        'format': 'lpcm',
+        'format': format,
         'sampleRateHertz': TTS_RATE,
-        'speed': 1.2
+        'speed': speed
     }
     headers = {
         "Authorization": f"Api-Key {api_key}",

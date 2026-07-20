@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 from loguru import logger
+from lib.tts_rest_services import _tts_synthesizer
 
 DEFAULT_TTS_DIR = Path(__file__).resolve().parent.parent / "data" / "tts_cache"
 MAX_TEXT_LENGTH = 200  # Google TTS query limit
@@ -141,7 +142,7 @@ async def _tts_google(
     speed: float = 1.5,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Generate TTS audio via Google Translate and save as MP3.
+    """Generate TTS audio via Google Translate and save as MP3 (FREE, no API key)..
 
     Args:
         text: Text to speak (max 200 chars)
@@ -163,7 +164,15 @@ async def _tts_google(
     # Derive filename from text hash
     text_hash = hashlib.md5(f"{lang}:{text}".encode()).hexdigest()[:12]
     out_path = dest_dir / f"tts_{lang}_{text_hash}.mp3"
-
+    if out_path.exists():
+        logger.info(f"Using cached TTS: {out_path.name}")
+        return {
+            "ok": True,
+            "path": str(out_path),
+            "file_size": out_path.stat().st_size,
+            "text": text,
+            "lang": lang,
+        }
     # Build Google Translate TTS URL
     encoded_text = urllib.parse.quote(text)
     tts_url = (
@@ -197,6 +206,58 @@ async def _tts_google(
         return {"ok": False, "error": str(e)}
 
 
+async def _tts_yandex(
+        text: str,
+        lang: str = "ru-RU",
+        speed: float = 1.5,
+        output_dir: str | None = None,
+    ) -> dict[str, Any]:
+
+    """Generate TTS audio via Yandex SpeechKit and save as MP3.
+
+    Args:
+        text: Text to speak (max 200 chars)
+        lang: Language code (ru-RU, en-US, etc.)
+        speed: Speech speed (1.0 = normal, 1.5 = fast)
+        output_dir: Directory to save audio (default: data/tts_cache)
+
+    Returns:
+        dict with ok, path, file_size, text, lang
+    """
+    dest_dir = Path(output_dir) if output_dir else DEFAULT_TTS_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    text_hash = hashlib.md5(f"{lang}:{text}".encode()).hexdigest()[:12]
+    out_path = dest_dir / f"tts_{lang}_{text_hash}.mp3"
+    if out_path.exists():
+        logger.info(f"Using cached TTS: {out_path.name}")
+        return {
+            "ok": True,
+            "path": str(out_path),
+            "file_size": out_path.stat().st_size,
+            "text": text,
+            "lang": lang,
+        }
+    try:
+        audio_data = b''
+        async for audio_chunk in _tts_synthesizer(text, lang=lang, speed=speed, format="mp3"):
+            audio_data += audio_chunk
+
+        await asyncio.to_thread(out_path.write_bytes, audio_data)
+
+        file_size = out_path.stat().st_size
+        logger.info(f"TTS generated: '{text[:50]}...' → {out_path.name} ({file_size} bytes)")
+        return {
+            "ok": True,
+            "path": str(out_path),
+            "file_size": file_size,
+            "text": text,
+            "lang": lang,
+        }
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Tool functions
 # ---------------------------------------------------------------------------
@@ -204,11 +265,11 @@ async def _tts_google(
 
 async def tts_generate(
     text: str,
-    lang: str = "ru",
-    speed: float = 1.5,
+    lang: str = "ru-RU",
+    speed: float = 1.2,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Generate speech audio from text using Google Translate TTS (FREE, no API key).
+    """Generate speech audio from text.
 
     Args:
         text: Text to speak (max 200 chars, Russian by default)
@@ -219,7 +280,8 @@ async def tts_generate(
     Returns:
         dict: {\"ok\": True, \"path\": \"...\", \"file_size\": 1234} on success
     """
-    return await _tts_google(text=text, lang=lang, speed=speed, output_dir=output_dir)
+    # return await _tts_google(text=text, lang=lang, speed=speed, output_dir=output_dir)
+    return await _tts_yandex(text=text, lang=lang, speed=speed, output_dir=output_dir)
 
 
 async def tts_speak_aloud(text: str):
