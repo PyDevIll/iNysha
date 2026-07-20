@@ -162,7 +162,7 @@ async def analyze_dynamic_scene(
 
     # Send all images in one request
     result = await _call_qwen_vl_multi(image_urls, query)
-    logger.debug(f"take_a_look result: {result}")
+    logger.debug(f"analyze_dynamic_scene result: {result}")
     return result
 
 

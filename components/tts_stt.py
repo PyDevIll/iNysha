@@ -27,14 +27,14 @@ async def input_from_mic():
         print("Mic listening task cancelled")
     except Exception as e:
         raise e
-    finally:
-        stt_stop()
-        tts_stt_enabled = False
 
 
-def tts_stt_toggle():
+def tts_stt_toggle(force_on_off = None):
     global tts_stt_enabled, stt_listen_task
     tts_stt_enabled = not tts_stt_enabled
+    if force_on_off is not None and force_on_off != tts_stt_enabled:
+        tts_stt_enabled = force_on_off
+
     if tts_stt_enabled:
         stt_start()
         stt_listen_task = asyncio.create_task(input_from_mic())

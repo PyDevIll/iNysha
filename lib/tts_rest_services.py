@@ -113,7 +113,6 @@ audio = pyaudio.PyAudio()
 def _transcribe_yandex_bytes(
     audio_bytes: bytes,
     lang: str = "ru-RU",
-    topic: str = "general",
 ):
     """Send raw audio bytes to Yandex SpeechKit STT API and return result."""
     url = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
@@ -121,10 +120,12 @@ def _transcribe_yandex_bytes(
     if not api_key:
         return {"ok": False, "error": "YANDEX_SPEECH_API_KEY env var not set"}
     params = {
-        "topic": topic,
+        "topic": "general",
         "lang": lang,
         "format": "lpcm",
         "sampleRateHertz": STT_RATE,
+        "rawResults": True,
+        "literature_text": True
     }
     headers = {
         "Authorization": f"Api-Key {api_key}",
@@ -154,7 +155,7 @@ def _transcribe_yandex_bytes(
         return {"ok": False, "error": str(exc)}
 
 
-async def stt_listen_and_collect():
+async def stt_listen_and_collect(speech_callback):
     vad = webrtcvad.Vad(3)
     last_frames = collections.deque(maxlen=10)
     voice_frames = []
@@ -191,6 +192,11 @@ async def stt_listen_and_collect():
             voice_started = True
             voice_frames.append(data)
             voice_frames_count += 1
+            # --- long speech reaction ---
+            if speech_callback:
+                if voice_frames_count >= MINIMAL_VOICE_FRAMES:
+                    await speech_callback()
+            # ----------------------------
             last_voice_frame_time = time()
 
             print("", end="\r")
@@ -259,10 +265,10 @@ async def stt_transcriber():
                 yield stt_result.get("text")
 
 
-def stt_start():
+def stt_start(speech_callback = None):
     global stt_listen_task
     stt_start_audio_stream()
-    stt_listen_task = asyncio.create_task(stt_listen_and_collect())
+    stt_listen_task = asyncio.create_task(stt_listen_and_collect(speech_callback))
 
 
 def stt_stop():

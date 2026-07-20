@@ -5,8 +5,6 @@ from loguru import logger
 from agent import Agent
 from builtin_tools import register_all as register_builtin_tools
 from tool_registry import get_registry
-from time import time
-import re
 import sys
 import asyncio
 
@@ -28,6 +26,7 @@ def get_request_queue():
 
 def get_agent():
     return agent
+
 
 # ---- Worker coroutine (processes requests sequentially) ----
 async def worker() -> None:
@@ -68,6 +67,10 @@ async def get_command():
         if command == "/p":     # prompt
             if parameters:
                 await request_queue.put({"type": "user", "prompt": f"[Command prompt]: {parameters}"})
+
+        if command == "/l":
+            tts_stt_toggle(False)
+            ...
 
 
 # --------- APP ENTRY POINT -----------
