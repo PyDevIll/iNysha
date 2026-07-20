@@ -249,7 +249,7 @@ class Agent:
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     active_tool_call_ids.add(tc["id"])
-                fixed_messages.append(msg)  # <-- THIS WAS MISSING
+                fixed_messages.append(msg)
             elif role == "tool":
                 tc_id = msg.get("tool_call_id")
                 if tc_id and tc_id in active_tool_call_ids:
@@ -342,17 +342,9 @@ class Agent:
         if self.messages.overflow and self._helper_agent:
             logger.warning(
                 f"Overflow before LLM request ({self.messages.get_context_length()} tokens) — "
-                "compressing proactively"
+                "starting background compression"
             )
-            try:
-                await asyncio.wait_for(
-                    self.messages.compress(self._helper_agent),
-                    timeout=60.0
-                )
-            except asyncio.TimeoutError:
-                logger.error("Proactive compression timed out")
-            except Exception as e:
-                logger.error(f"Proactive compression failed: {e}")
+            self.messages.start_background_compression(self._helper_agent)
 
         while iteration < max_iterations:
             iteration += 1
@@ -410,15 +402,8 @@ class Agent:
 
                 # Check if context overflowed — trigger compression
                 if self.messages.overflow and self._helper_agent:
-                    try:
-                        await asyncio.wait_for(
-                            self.messages.compress(self._helper_agent),
-                            timeout=60.0
-                        )
-                    except asyncio.TimeoutError:
-                        logger.error("Compression timed out after 60s")
-                    except Exception as e:
-                        logger.error(f"Compression failed: {e}")
+                    logger.info("Context overflow after tools – starting background compression")
+                    self.messages.start_background_compression(self._helper_agent)
             else:
                 # Final response — no tool calls
                 content = message.get("content", "")

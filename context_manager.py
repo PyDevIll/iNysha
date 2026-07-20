@@ -57,7 +57,7 @@ MASK_BATCH_SIZE = 12                 # mask tool outputs older than this many ms
 COMPRESSION_BATCH = 30              # trigger LLM summarization every N messages
 PERSISTENT_FILE = "persistent_memory.json"
 EMERGENCY_FILE = "emergency_save.json"
-MAX_COMPRESSED_DICTS = 5            # merge compressed summaries when exceeding this
+MAX_COMPRESSED_DICTS = 8            # merge compressed summaries when exceeding this
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -300,6 +300,7 @@ class ContextPool:
         self._assembler = ContextAssembler(token_limit=max_tokens)
         self._save_counter: int = 0
         self.overflow: bool = False
+        self._compression_task: Optional[asyncio.Task] = None
 
         # Caches
         self._token_counts: dict[int, int] = {}   # id(entry) -> token count
@@ -624,6 +625,30 @@ class ContextPool:
             sections["raw_text"] = text  # keep raw text for reference
 
         return sections
+
+
+    def start_background_compression(self, helper_agent) -> bool:
+        """
+        Launch compression in the background if not already running.
+        Returns True if a new task was started.
+        """
+        if self._compression_task is not None and not self._compression_task.done():
+            logger.debug("Compression already running, skipping")
+            return False
+
+        self._compression_task = asyncio.create_task(self._safe_compress(helper_agent))
+        return True
+
+
+    async def _safe_compress(self, helper_agent):
+        """Wrapper that logs errors."""
+        try:
+            await self.compress(helper_agent)
+        except Exception as e:
+            logger.exception(f"Background compression failed: {e}")
+        finally:
+            self._compression_task = None  # allow new runs
+
 
     # ── Crash Recovery ─────────────────────────────────────────────
     def _restore_if_needed(self) -> bool:
