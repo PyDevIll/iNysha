@@ -5,7 +5,6 @@ import re
 from app import get_request_queue, get_agent
 from lib.tts_rest_services import (
     tts_speak, stt_transcriber, stt_start, stt_stop,
-    audio
 )
 
 # |---------- TTS - STT Dialogue code -----------|
@@ -29,18 +28,27 @@ async def input_from_mic():
         raise e
 
 
-def tts_stt_toggle(force_on_off = None):
+async def tts_stt_toggle(force_on_off = None):
     global tts_stt_enabled, stt_listen_task
     tts_stt_enabled = not tts_stt_enabled
-    if force_on_off is not None and force_on_off != tts_stt_enabled:
+    if force_on_off is not None:
         tts_stt_enabled = force_on_off
 
     if tts_stt_enabled:
         stt_start()
         stt_listen_task = asyncio.create_task(input_from_mic())
     else:
-        stt_listen_task.cancel()
+        if stt_listen_task:
+            stt_listen_task.cancel()
+            try:
+                await stt_listen_task  # wait for it to finish
+            except asyncio.CancelledError:
+                pass
+            stt_listen_task = None
+
         stt_stop()
+
+    return tts_stt_enabled
 
 
 def _sanitize_for_tts(text: str) -> str:

@@ -28,6 +28,10 @@ def stt_collect_for_transcribing(audio_bytes):
     print("Audio for STT appended to queue.", "Size = ", len(stt_audio_queue))
 
 
+# |----------------|
+# |--- Speaking ---|
+# |----------------|
+
 async def _tts_synthesizer(
         text: str,
         lang: str = 'ru-RU',
@@ -88,7 +92,15 @@ async def tts_speak(text):
         audio_data += audio_chunk
     print("TTS ended")
     print('Speaking!')
-    await asyncio.to_thread(play_pydub, audio_data, TTS_RATE)
+    try:
+        await asyncio.to_thread(play_pydub, audio_data, TTS_RATE)
+    except asyncio.CancelledError:
+        print("TTS Speaker: cancelled")
+    except (OSError, IOError) as e:
+        print("TTS Speaker: stream closed, stopping")
+    except Exception as e:
+        print(f"TTS Speaker: unexpected error: {e}")
+
     print('Speaking done')
 
 
@@ -168,10 +180,12 @@ async def stt_listen_and_collect(speech_callback):
 
     while True:
         try:
-            # Читаем данные в отдельном потоке
+            # Use asyncio.to_thread, but catch CancelledError explicitly
             data = await asyncio.to_thread(stream.read, FRAME_BYTES)
+        except asyncio.CancelledError:
+            print("STT listener cancelled")
+            break
         except (OSError, IOError) as e:
-            # Стрим закрыт – выходим (это ожидаемое поведение)
             print("STT listener: stream closed, stopping")
             break
         except Exception as e:
@@ -195,7 +209,7 @@ async def stt_listen_and_collect(speech_callback):
             # --- long speech reaction ---
             if speech_callback:
                 if voice_frames_count >= MINIMAL_VOICE_FRAMES:
-                    await speech_callback()
+                    speech_callback(voice_frames_count)
             # ----------------------------
             last_voice_frame_time = time()
 
@@ -248,6 +262,8 @@ def stt_stop_audio_stream():
             stt_audio_stream.close()
         except Exception as e:
             print(f"Error closing stream: {e}")
+        finally:
+            stt_audio_stream = None
 
 
 async def stt_transcriber():
@@ -272,9 +288,11 @@ def stt_start(speech_callback = None):
 
 
 def stt_stop():
-    stt_listen_task.cancel()
+    global stt_audio_stream, stt_listen_task
     stt_stop_audio_stream()
     stt_audio_queue.clear()
+    if stt_listen_task and not stt_listen_task.done():
+        stt_listen_task.cancel()
 
 
 atexit.register(audio.terminate)

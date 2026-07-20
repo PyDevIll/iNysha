@@ -33,6 +33,8 @@ async def worker() -> None:
     from components.max import process_max_message
     from components.cmd_line import process_command_prompt
     from components.tts_stt import process_voice_input
+    from components.live import process_live_scene
+
     while True:
         req = await request_queue.get()
         try:
@@ -42,6 +44,8 @@ async def worker() -> None:
                 await process_command_prompt(req["prompt"])
             elif req["type"] == "tts":
                 await process_voice_input(req["text"])
+            elif req["type"] == "live":
+                await process_live_scene(req["scene"])
             # elif req["type"] == "scheduled":
             #     await process_scheduled_task(req["task"])
             else:
@@ -54,6 +58,8 @@ async def worker() -> None:
 
 async def get_command():
     from components.tts_stt import tts_stt_toggle
+    from components.live import live_toggle
+
     while True:
         user_request = await asyncio.to_thread(input, "User command: ")
         parsed = user_request.split(" ", 1)
@@ -62,15 +68,18 @@ async def get_command():
 
         print("Got user command:", command, ", parameters:", parameters)
         if command == "/v":     # voice
-            tts_stt_toggle()
+            _on_off = await tts_stt_toggle()
+            print("[Command]: TTS-STT Dialogue mode switched", "on" if _on_off else "off")
 
         if command == "/p":     # prompt
             if parameters:
                 await request_queue.put({"type": "user", "prompt": f"[Command prompt]: {parameters}"})
 
-        if command == "/l":
-            tts_stt_toggle(False)
-            ...
+        if command == "/l":     # live
+            _on_off = await tts_stt_toggle(False)
+            print("[Command]: TTS-STT Dialogue mode switched", "on" if _on_off else "off")
+            _on_off = await live_toggle()
+            print("[Command]: Live mode switched", "on" if _on_off else "off")
 
 
 # --------- APP ENTRY POINT -----------

@@ -122,6 +122,7 @@ def _capture_screenshot_to_bytes(monitor: int = 1) -> bytes:
     """
     sct = get_mss()
     if monitor < 0 or monitor >= len(sct.monitors):
+        logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors) - 1}), using primary (1)")
         monitor = 1
     img = sct.grab(sct.monitors[monitor])
     return mss.tools.to_png(img.rgb, img.size)
