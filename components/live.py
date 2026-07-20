@@ -14,7 +14,7 @@ update_vision_task = None
 live_enabled = False
 last_scene_update_time = time()
 SCENE_MINIMAL_UPDATE_PERIOD = 30    # seconds
-SCENE_MONITOR = 3
+SCENE_MONITOR = 2
 
 # scene data for LLM
 live_scene_request: dict = None

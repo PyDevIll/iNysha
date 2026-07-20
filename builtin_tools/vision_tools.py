@@ -8,7 +8,8 @@ import asyncio
 
 import mss
 import mss.tools
-from pathlib import Path
+import io
+from PIL import Image
 
 import httpx
 from loguru import logger
@@ -115,53 +116,67 @@ def get_mss():
         _mss_instance = mss.mss()
     return _mss_instance
 
-def _capture_screenshot_to_bytes(monitor: int = 1) -> bytes:
+
+def _capture_screenshot_to_bytes(monitor: int = 1, resize_factor: float = 0.5) -> bytes:
     """
-    Capture a screenshot of the given monitor and return PNG bytes.
-    monitor: 1 = primary, 2 = secondary, etc. (0 = all monitors combined).
+    Capture a screenshot and return PNG bytes, optionally resized.
     """
     sct = get_mss()
     if monitor < 0 or monitor >= len(sct.monitors):
-        logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors) - 1}), using primary (1)")
+        logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors)-1}), using primary (1)")
         monitor = 1
-    img = sct.grab(sct.monitors[monitor])
-    return mss.tools.to_png(img.rgb, img.size)
+
+    # Grab the screenshot (returns a mss.ScreenShot object)
+    raw = sct.grab(sct.monitors[monitor])
+
+    # Convert to PIL Image
+    pil_img = Image.frombytes("RGB", raw.size, raw.rgb)
+
+    # Resize if needed
+    if resize_factor != 1.0:
+        width, height = pil_img.size
+        new_size = (int(width * resize_factor), int(height * resize_factor))
+        pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+
+    # Convert to PNG bytes
+    with io.BytesIO() as output:
+        pil_img.save(output, format="PNG")
+        return output.getvalue()
 
 
 async def analyze_dynamic_scene(
     monitor: int = 1,
     interval_seconds: float = 0.5,
     num_frames: int = 5,
-    query: str = "Опиши динамические изменения в этих последовательных кадрах. Дай детальный анализ того, что происходит в целом на русском языке."
+    query: str = "Опиши динамические изменения в этих последовательных кадрах. Дай детальный анализ того, что происходит в целом, на русском языке."
 ) -> str:
     """
-    Capture multiple consecutive screenshots at a set interval and analyze them together.
+    Capture multiple consecutive screenshots, resize them, and analyze together.
 
     Args:
         monitor: Monitor index (1 = primary, 2 = secondary, etc.).
         interval_seconds: Time between captures.
         num_frames: Number of screenshots to capture.
+        resize_factor: Scale factor for image dimensions (0.5 = half size). Default 0.5.
         query: Question to ask about the sequence.
 
     Returns:
         The model's textual description of the dynamic scene.
     """
-    logger.debug(f"analyze_dynamic_scene: monitor={monitor}, interval={interval_seconds}, frames={num_frames}")
+    resize_factor: float = 0.5
+    logger.debug(f"analyze_dynamic_scene: monitor={monitor}, interval={interval_seconds}, frames={num_frames}, resize={resize_factor}")
 
     image_urls = []
     for i in range(num_frames):
-        # Capture screenshot bytes
-        png_bytes = _capture_screenshot_to_bytes(monitor)
-        # Encode to base64 and create data URL
+        # Capture and resize in one step
+        png_bytes = _capture_screenshot_to_bytes(monitor, resize_factor)
         b64_str = base64.b64encode(png_bytes).decode("utf-8")
         data_url = f"data:image/png;base64,{b64_str}"
         image_urls.append(data_url)
 
-        # Wait before next capture (except after last)
         if i < num_frames - 1:
             await asyncio.sleep(interval_seconds)
 
-    # Send all images in one request
     result = await _call_qwen_vl_multi(image_urls, query)
     logger.debug(f"analyze_dynamic_scene result: {result}")
     return result
