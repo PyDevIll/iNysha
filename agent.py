@@ -16,7 +16,7 @@ from context_manager import ContextPool
 from tool_registry import get_registry
 
 LLM_MAX_OUTPUT_TOKENS = 30000
-LLM_MODEL = "deepseek-v4-flash"  # thinking mode enabled
+LLM_MODEL = "gpt://b1gd6m9pgdlccgn3of5i/aliceai-llm-flash/latest"
 
 
 def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dict]:
@@ -78,10 +78,11 @@ class Agent:
         last_memory: Optional[list] = None,
         use_tools: bool = True,
         save_history: bool = True,
-        base_url: str = "https://api.deepseek.com/",
+        base_url: str = "https://ai.api.cloud.yandex.net/v1",
     ):
         self.name = name
-        api_key = os.environ.get(f'DEEPSEEK_API_KEY_{self.name}') or os.environ.get('DEEPSEEK_API_KEY', '')
+        # api_key = os.environ.get(f'DEEPSEEK_API_KEY_{self.name}') or os.environ.get('DEEPSEEK_API_KEY', '')
+        api_key = os.getenv("YANDEXGPT_API_KEY")
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._system_prompt = {"role": "system", "name": "Creator", "content": system_prompt}
         self._base_prompts = base_prompts or []
@@ -300,7 +301,7 @@ class Agent:
                 stream=False,
                 max_tokens=LLM_MAX_OUTPUT_TOKENS,
                 temperature=1.0,
-                extra_body={"thinking": {"type": "enabled"} if enable_reasoning else {"type": "disabled"}}
+                # extra_body={"thinking": {"type": "enabled"} if enable_reasoning else {"type": "disabled"}}
             )
         except Exception as e:
             logger.exception(f"LLM API call failed: {e}")
