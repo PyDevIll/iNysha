@@ -11,3 +11,4 @@ requests~=2.34.2
 pydub~=0.25.1
 webrtcvad-wheels~=2.0.14
 PyAudio~=0.2.14
+pillow

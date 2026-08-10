@@ -18,7 +18,7 @@ DOWNLOADS_DIR = Path(__file__).resolve().parent / "data" / "downloads"
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
-request_queue = None  # will be set in main
+request_queue = None
 agent = None
 
 def get_request_queue():
@@ -36,6 +36,13 @@ async def worker() -> None:
     from components.live import process_live_scene
 
     while True:
+        # log queue content
+        _log_msg = f"Worker queue count: {request_queue.qsize()}"
+        for num, item in enumerate(list(request_queue._queue)):
+            _log_msg += f"\n {num}: {item['type']}"
+        logger.info(_log_msg)
+
+        # process request_queue item
         req = await request_queue.get()
         try:
             if req["type"] == "max":

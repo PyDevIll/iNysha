@@ -15,7 +15,7 @@ import httpx
 from loguru import logger
 import atexit
 
-QWEN_MODEL = "qwen3-vl-plus"
+QWEN_MODEL = "qwen-vl-plus"
 _mss_instance = None
 
 def _get_env_or_raise(key: str) -> str:
