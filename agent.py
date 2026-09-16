@@ -15,8 +15,8 @@ from loguru import logger
 from context_manager import ContextPool
 from tool_registry import get_registry
 
-LLM_MAX_OUTPUT_TOKENS = 30000
-LLM_MODEL = "deepseek-v4-flash"  # thinking mode enabled
+LLM_MAX_OUTPUT_TOKENS = 50000
+LLM_MODEL = "deepseek-flash"  # thinking mode enabled
 
 
 def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dict]:

@@ -1,2 +1,7 @@
 .env
-.aider*
+.venv/
+__pycache__/
+builtin_tools/__pycache__/
+components/__pycache__/
+data/
+lib/__pycache__/
