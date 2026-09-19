@@ -50,14 +50,23 @@ def _token_count(text: str) -> int:
     return max(1, len(text) // 3)
 
 
+def count_tokens(text: str) -> int:
+    """Public token counter (tiktoken cl100k, char/3 fallback)."""
+    return _token_count(text)
+
+
 # ── Constants ──────────────────────────────────────────────────────────
-DEFAULT_MAX_TOKENS = 100000          # soft cap; proactive trim at 80%
-SLIDING_WINDOW_SIZE = 12            # last N messages kept verbatim
-MASK_BATCH_SIZE = 12                 # mask tool outputs older than this many msgs
-COMPRESSION_BATCH = 30              # trigger LLM summarization every N messages
+DEFAULT_MAX_TOKENS = 500000          # soft cap; proactive trim at 80%
+SLIDING_WINDOW_SIZE = 20            # last N messages kept verbatim
+MASK_BATCH_SIZE = 20                 # mask tool outputs older than this many msgs
+COMPRESSION_BATCH = 50              # trigger LLM summarization every N messages
 PERSISTENT_FILE = "persistent_memory.json"
 EMERGENCY_FILE = "emergency_save.json"
-MAX_COMPRESSED_DICTS = 8            # merge compressed summaries when exceeding this
+MAX_COMPRESSED_DICTS = 16            # merge compressed summaries when exceeding this
+OVERFLOW_RATIO = 0.70               # overflow flag when assembled context >= this share
+COMPRESS_TRIGGER_RATIO = 0.70       # compress when assembled context >= this share
+MAX_SUMMARY_CHARS = 4000            # warn when a single summary is larger than this
+MAX_NARRATIVE_CHARS = 500           # narrative is capped to ~1-2 sentences
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -300,6 +309,7 @@ class ContextPool:
         self._assembler = ContextAssembler(token_limit=max_tokens)
         self._save_counter: int = 0
         self.overflow: bool = False
+        self.base_prompt_tokens: int = 0   # static system+base prompt cost (set by Agent)
         self._compression_task: Optional[asyncio.Task] = None
 
         # Caches
@@ -309,6 +319,7 @@ class ContextPool:
 
         # Attempt crash recovery
         self._restore_if_needed()
+        self._seed_from_last_compression()
 
     # ── Properties ─────────────────────────────────────────────────
     @property
@@ -335,9 +346,34 @@ class ContextPool:
 
     # ── Core API ───────────────────────────────────────────────────
     def get_context_length(self) -> int:
-        """Estimate token count of entire context using tiktoken."""
+        """Token count of the master log only (excludes compressed/persistent)."""
         total = 0
         for entry in self._all_entries:
+            total += self._token_count_entry(entry)
+        return total
+
+    @staticmethod
+    def _compressed_dict_tokens(d: dict) -> int:
+        """Tokens of what a compressed dict actually contributes to the prompt."""
+        text = "\n".join(d.get(k) or "" for k in ("facts", "tool_results", "decisions", "narrative"))
+        if not text.strip():
+            text = d.get("raw_text") or ""
+        return _token_count(text)
+
+    def get_assembled_tokens(self) -> int:
+        """Estimated tokens of the ACTUAL prompt layers this pool contributes.
+
+        Includes persistent + compressed + masked + sliding + the static
+        base-prompt cost (``base_prompt_tokens``, set by the Agent). This is the
+        number the overflow / compression decision must use.
+        """
+        total = self.base_prompt_tokens
+        total += _token_count(self._persistent.as_context_string())
+        for d in self._compressed_dicts:
+            total += self._compressed_dict_tokens(d)
+        for entry in self.masked_entries:
+            total += self._token_count_entry(entry)
+        for entry in self.sliding_window:
             total += self._token_count_entry(entry)
         return total
 
@@ -416,24 +452,23 @@ class ContextPool:
         async with self._compress_lock:
             self.log_state("BEFORE compression")
 
-            est_tokens = self.get_context_length()
-            overflow_ratio = est_tokens / self.max_tokens if self.max_tokens > 0 else 0
-            enough_entries = len(self._all_entries) >= 20
-            token_overflow = overflow_ratio >= 0.70
-            enough_old = (len(self._all_entries) - self.window_size) >= 10
+            assembled = self.get_assembled_tokens()
+            overflow_ratio = assembled / self.max_tokens if self.max_tokens > 0 else 0
+            old_count = len(self._all_entries) - self.window_size
 
             if not helper_agent:
                 return None
-            if not enough_entries and not token_overflow:
+            # Compress ONLY when the assembled context (all layers + base prompts)
+            # is genuinely near the budget, and there is something older than the
+            # sliding window to summarize. Never on message count alone.
+            if overflow_ratio < COMPRESS_TRIGGER_RATIO:
                 return None
-            if not enough_old and not token_overflow:
-                return None
-            if len(self._all_entries) < 3:
+            if old_count < 2:
                 return None
 
             logger.info(
-                f"Context compression triggered: {len(self._all_entries)} entries, "
-                f"{est_tokens} tokens ({overflow_ratio:.0%})"
+                f"Context compression triggered: assembled {assembled} tokens "
+                f"({overflow_ratio:.0%} of {self.max_tokens}), {len(self._all_entries)} entries"
             )
 
             # Take the oldest batch beyond sliding window
@@ -450,12 +485,19 @@ class ContextPool:
                 "name": "MASTERMIND",
                 "content": (
                     "**ACTION**: COMPRESS\n\n"
-                    "Output a **structured summary** with the following sections:\n"
-                    "- **Key Facts:** (decisions, important data, user intent)\n"
-                    "- **Tool Results:** (critical outputs, file contents, search snippets)\n"
-                    "- **Decisions:** (what was decided/changed)\n"
-                    "- **Narrative:** (a detailed, unstructured story of the interaction, describing the flow, user messages, agent reasoning, and actions)\n\n"
-                    "Use bullet points for structured sections. Keep relevant details, discard noise.\n\n"
+                    "Compress the interaction log below into a COMPACT structured summary.\n"
+                    "Be terse and factual: the whole output MUST stay under ~350 words. "
+                    "Use short bullet points. No preamble, no repetition, no filler.\n\n"
+                    "Output exactly these markdown sections:\n"
+                    "## Key Facts\n"
+                    "- decisions, important data, user intent, stable facts\n"
+                    "## Tool Results\n"
+                    "- only critical outputs (paths, values, errors) - drop routine successes\n"
+                    "## Decisions\n"
+                    "- what was decided or changed\n"
+                    "## Narrative\n"
+                    "- 1-2 short sentences describing the overall flow\n\n"
+                    "Discard noise, repetitions and transient UI details.\n\n"
                     "**CONTENT**:\n" + chat_text
                 ),
             }
@@ -478,6 +520,7 @@ class ContextPool:
             parsed = self._parse_compressed_text(compressed_text)
             now = datetime.now().strftime("%d.%m.%Y, %H:%M")
             parsed["timestamp"] = now
+            parsed = self._cap_summary(parsed)
 
             # Store as dict for structured access
             self._compressed_dicts.append(parsed)
@@ -555,11 +598,11 @@ class ContextPool:
                     "**ACTION**: META‑COMPRESS\n\n"
                     "You are given multiple structured summaries of past interactions. "
                     "Synthesize them into a single comprehensive summary that captures the most important information.\n\n"
-                    "Output a structured summary with these sections:\n"
-                    "- **Key Facts:** (overarching decisions, important data, user intent)\n"
-                    "- **Tool Results:** (critical tool outputs, key findings)\n"
-                    "- **Decisions:** (major decisions made)\n"
-                    "- **Narrative:** (a unified story of the entire interaction, describing the flow, user messages, agent reasoning, and actions)\n\n"
+                    "Merge them into ONE compact summary, shorter than their combined size "
+                    "and under ~350 words. Keep only durable facts, decisions and outcomes.\n\n"
+                    "Output exactly these markdown sections:\n"
+                    "## Key Facts\n## Tool Results\n## Decisions\n"
+                    "## Narrative\n- 1-2 short sentences describing the overall flow\n\n"
                     "Focus on high‑level insights, discard redundant details.\n\n"
                     "**CONTENT**:\n" + combined
             ),
@@ -579,6 +622,7 @@ class ContextPool:
 
         parsed = self._parse_compressed_text(merged_text)
         parsed["timestamp"] = datetime.now().strftime("%d.%m.%Y, %H:%M")
+        parsed = self._cap_summary(parsed)
 
         # Replace the list with the single merged summary
         self._compressed_dicts = [parsed]
@@ -589,42 +633,53 @@ class ContextPool:
 
     @staticmethod
     def _parse_compressed_text(text: str) -> dict:
-        """Parse LLM response into structured dict with sections using robust regex."""
-        # Define patterns for each section (case-insensitive, optional bold/asterisks)
-        patterns = {
-            "facts": r'\*\*Key Facts:\*\*\s*(.*?)(?=\*\*Tool Results:\*\*|\*\*Decisions:\*\*|\*\*Narrative:\*\*|$)',
-            "tool_results": r'\*\*Tool Results:\*\*\s*(.*?)(?=\*\*Key Facts:\*\*|\*\*Decisions:\*\*|\*\*Narrative:\*\*|$)',
-            "decisions": r'\*\*Decisions:\*\*\s*(.*?)(?=\*\*Key Facts:\*\*|\*\*Tool Results:\*\*|\*\*Narrative:\*\*|$)',
-            "narrative": r'\*\*Narrative:\*\*\s*(.*?)(?=\*\*Key Facts:\*\*|\*\*Tool Results:\*\*|\*\*Decisions:\*\*|$)',
-        }
-        # Also try with leading dash (bullet) variants
-        alt_patterns = {
-            "facts": r'-\s*\*\*Key Facts:\*\*\s*(.*?)(?=-\s*\*\*Tool Results:\*\*|-\s*\*\*Decisions:\*\*|-\s*\*\*Narrative:\*\*|$)',
-            "tool_results": r'-\s*\*\*Tool Results:\*\*\s*(.*?)(?=-\s*\*\*Key Facts:\*\*|-\s*\*\*Decisions:\*\*|-\s*\*\*Narrative:\*\*|$)',
-            "decisions": r'-\s*\*\*Decisions:\*\*\s*(.*?)(?=-\s*\*\*Key Facts:\*\*|-\s*\*\*Tool Results:\*\*|-\s*\*\*Narrative:\*\*|$)',
-            "narrative": r'-\s*\*\*Narrative:\*\*\s*(.*?)(?=-\s*\*\*Key Facts:\*\*|-\s*\*\*Tool Results:\*\*|-\s*\*\*Decisions:\*\*|$)',
-        }
+        """Parse a summary into sections.
 
+        Tolerates the forms LLMs actually emit: ``## Key Facts`` (markdown
+        headings), ``**Key Facts:**``, ``- **Key Facts:**`` and plain
+        ``Key Facts:``.
+        """
+        header_re = re.compile(
+            r'(?im)^[ \t>*#\-]*\**\s*(key facts|tool results|decisions|narrative|summary)\s*:?\s*\**\s*$'
+        )
         sections = {"facts": "", "tool_results": "", "decisions": "", "narrative": ""}
-        # Try primary patterns first
-        for key, pattern in patterns.items():
-            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-            if match:
-                sections[key] = match.group(1).strip()
-        # If any section missing, try alt patterns
-        for key, pattern in alt_patterns.items():
-            if not sections[key]:
-                match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-                if match:
-                    sections[key] = match.group(1).strip()
+        matches = list(header_re.finditer(text or ""))
+        for i, m in enumerate(matches):
+            title = m.group(1).lower()
+            if "fact" in title:
+                key = "facts"
+            elif "tool" in title:
+                key = "tool_results"
+            elif "decision" in title:
+                key = "decisions"
+            else:
+                key = "narrative"
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = (text[start:end] or "").strip()
+            if body and not sections[key]:
+                sections[key] = body
 
-        # Fallback: if still empty, treat entire text as raw
-        if not any(sections.values()):
-            sections["raw_text"] = text
-        else:
-            sections["raw_text"] = text  # keep raw text for reference
-
+        # Keep raw_text ONLY as a fallback so emergency_save stays small.
+        if not any(sections[k] for k in ("facts", "tool_results", "decisions", "narrative")):
+            sections["raw_text"] = text or ""
         return sections
+
+    @staticmethod
+    def _cap_summary(d: dict) -> dict:
+        """Trim an over-long narrative and warn if a summary is still large."""
+        narr = d.get("narrative") or ""
+        if len(narr) > MAX_NARRATIVE_CHARS:
+            d["narrative"] = narr[:MAX_NARRATIVE_CHARS].rstrip() + " …"
+        total = sum(len(d.get(k) or "") for k in ("facts", "tool_results", "decisions", "narrative"))
+        if not total:
+            total = len(d.get("raw_text") or "")
+        if total > MAX_SUMMARY_CHARS:
+            logger.warning(
+                f"Compressed summary is large ({total} chars > {MAX_SUMMARY_CHARS}); "
+                "consider a stricter compression prompt"
+            )
+        return d
 
 
     def start_background_compression(self, helper_agent) -> bool:
@@ -667,12 +722,13 @@ class ContextPool:
                 self._compressed_dicts = raw["compressed_dicts"]
             else:
                 self._compressed_dicts = []
+            self._normalize_compressed_dicts()
             self._token_counts.clear()
             self._check_overflow()
             if self.overflow:
                 logger.warning(
                     f"🔄 Restored {len(self._all_entries)} entries — overflow "
-                    f"({self.get_context_length()} tokens), compression advised"
+                    f"({self.get_assembled_tokens()} assembled tokens), compression advised"
                 )
             else:
                 logger.info(f"🔄 Restored {len(self._all_entries)} messages from emergency save")
@@ -680,6 +736,56 @@ class ContextPool:
         except Exception as e:
             logger.error(f"Emergency restore failed: {e}")
             return False
+
+    def _seed_from_last_compression(self) -> None:
+        """Seed compressed memory from last_compression.txt when nothing was restored.
+
+        Keeps the previous summary in ONE place (``_compressed_dicts``), avoiding
+        the duplicate that occurs when the same text is also loaded as a base prompt.
+        """
+        if self._compressed_dicts:
+            return
+        f = self._data_dir / "last_compression.txt"
+        if not f.exists():
+            return
+        try:
+            text = f.read_text(encoding="utf-8").strip()
+            if not text:
+                return
+            parsed = self._parse_compressed_text(text)
+            parsed["timestamp"] = datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y, %H:%M")
+            parsed = self._cap_summary(parsed)
+            self._compressed_dicts.append(parsed)
+            logger.info("Seeded compressed memory from last_compression.txt")
+        except Exception as e:
+            logger.warning(f"Could not seed from last_compression.txt: {e}")
+
+    def _normalize_compressed_dicts(self) -> None:
+        """Migrate legacy summaries stored as ``raw_text`` into parsed sections.
+
+        Older versions always fell back to ``raw_text`` (the parser did not match
+        the model's ``## Heading`` output). Re-parsing them here drops the
+        verbose blob and keeps only the structured sections.
+        """
+        changed = False
+        for d in self._compressed_dicts:
+            has_sections = any(d.get(k) for k in ("facts", "tool_results", "decisions", "narrative"))
+            raw = d.get("raw_text")
+            if has_sections or not raw:
+                continue
+            parsed = self._parse_compressed_text(raw)
+            if any(parsed.get(k) for k in ("facts", "tool_results", "decisions", "narrative")):
+                parsed["timestamp"] = d.get("timestamp", "")
+                d.clear()
+                d.update(self._cap_summary(parsed))
+                changed = True
+            elif len(raw) > MAX_SUMMARY_CHARS:
+                # Unparseable legacy blob (often a raw transcript) — cap it.
+                d["raw_text"] = raw[:MAX_SUMMARY_CHARS].rstrip() + " …[truncated]"
+                logger.warning(f"Truncated an unparseable legacy summary ({len(raw)} chars)")
+                changed = True
+        if changed:
+            logger.info("Normalized legacy compressed summaries (raw_text -> sections)")
 
     def _emergency_save(self) -> None:
         """Save full state as JSON (both entries and compressed dicts)."""
@@ -807,18 +913,19 @@ class ContextPool:
         return d
 
     def _check_overflow(self) -> None:
-        """Check token budget and set overflow flag.
-        Trigger compression at 70% of max_tokens OR >=10 entries older than sliding window.
+        """Set the overflow flag from the ASSEMBLED context size (all layers).
+
+        Token-driven: fires only when the full prompt (base prompts + persistent
+        + compressed + masked + sliding) approaches the budget — never merely
+        because the message count grew.
         """
-        est_tokens = self.get_context_length()
-        overflow_token = est_tokens > self.max_tokens * 0.7
-        old_entries = len(self._all_entries) - self.window_size
-        overflow_old = (old_entries >= 10)
-        if overflow_token or overflow_old:
+        assembled = self.get_assembled_tokens()
+        threshold = self.max_tokens * OVERFLOW_RATIO
+        if assembled > threshold:
             self.overflow = True
             logger.warning(
-                f"Context at {est_tokens} tokens ({est_tokens/self.max_tokens:.0%}), "
-                f"old entries {old_entries} — overflow"
+                f"Context at {assembled} assembled tokens "
+                f"({assembled / self.max_tokens:.0%} of {self.max_tokens}) — overflow"
             )
         else:
             self.overflow = False
@@ -866,13 +973,11 @@ class ContextPool:
             logger.info(f"    first: {first.role} '{first_preview}'")
             logger.info(f"    last:  {last.role} '{last_preview}'")
         logger.info(f"  Compressed entries (dicts): {len(self._compressed_dicts)}")
-        total_comp_tokens = sum(
-            _token_count((d.get("facts","") + d.get("tool_results","") + d.get("decisions","") + d.get("narrative","")))
-            for d in self._compressed_dicts
-        )
-        logger.info(f"    tokens: ~{total_comp_tokens}")
+        total_comp_tokens = sum(self._compressed_dict_tokens(d) for d in self._compressed_dicts)
+        logger.info(f"    tokens: ~{total_comp_tokens} (incl. raw_text fallback)")
         logger.info(f"  Masked entries (old): {len(self.masked_entries)}")
         logger.info(f"  Persistent facts: {len(self._persistent.facts)}")
-        logger.info(f"  Estimated tokens: {self.get_context_length()}")
+        logger.info(f"  Master-log tokens: {self.get_context_length()}")
+        logger.info(f"  Assembled tokens: {self.get_assembled_tokens()} (base={self.base_prompt_tokens})")
         logger.info(f"  Overflow flag: {self.overflow}")
         logger.info("=====================================")
