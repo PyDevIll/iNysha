@@ -29,7 +29,7 @@ C:\Users\delph\PycharmProjects\iNysha\
 | * | `builtin_tools/additional_tools.py`  | exec_python, exec_shell, schedule_task, list_scheduled_tasks, cancel_scheduled_task |
 | * | `builtin_tools/max_tools.py`         | MAX Messenger tools: max_send_file, max_download_file, max_send_voice, max_send_message, max_get_messages |
 | * | `builtin_tools/rest_api_tool.py`     | Universal REST API caller (rest_api_call) |
-| * | `builtin_tools/vision_tools.py`      | Qwen VL vision analysis: vision_analyze (local file), vision_analyze_url (URL) |
+| * | `builtin_tools/vision_tools.py`      | DeepSeek vision analysis: vision_analyze (local file), vision_analyze_url (URL) |
 | * | `components/cmd_line.py`             | Processes command‑prompt input (stdin) via agent |
 | * | `components/max.py`                  | FastAPI webhook receiver for MAX updates, deferred reply logic, message processing |
 | * | `components/schedule.py`             | Processes due scheduled tasks (runs agent with the stored prompt) |

@@ -1,4 +1,4 @@
-"""Vision tools using Qwen VL (OpenAI-compatible API)."""
+"""Vision tools using DeepSeek (OpenAI-compatible API)."""
 
 import base64
 import mimetypes
@@ -11,11 +11,12 @@ import mss.tools
 import io
 from PIL import Image
 
-import httpx
+from openai import AsyncOpenAI
 from loguru import logger
 import atexit
 
-QWEN_MODEL = "qwen-vl-plus"
+DEEPSEEK_MODEL = "deepseek-flash"
+DEEPSEEK_MAX_TOKENS = 2048
 _mss_instance = None
 
 def _get_env_or_raise(key: str) -> str:
@@ -24,44 +25,41 @@ def _get_env_or_raise(key: str) -> str:
         raise ValueError(f"Environment variable {key} is not set")
     return value
 
+
+def _deepseek_client() -> AsyncOpenAI:
+    """Build an OpenAI-compatible client for the DeepSeek vision endpoint."""
+    return AsyncOpenAI(
+        api_key=_get_env_or_raise("DEEPSEEK_API_KEY"),
+        base_url=_get_env_or_raise("DEEPSEEK_API_ENDPOINT"),
+    )
+
+
 # Add the multi-image API caller
-async def _call_qwen_vl_multi(image_urls: list[str], query: str) -> str:
-    """Call Qwen VL with multiple images (as data URLs)."""
-    api_key = _get_env_or_raise("QWEN_API_KEY")
-    endpoint = _get_env_or_raise("QWEN_API_ENDPOINT")
-    chat_url = f"{endpoint}/chat/completions"
+async def _call_deepseek_vision(image_urls: list[str], query: str) -> str:
+    """Call DeepSeek vision with one or more images (data or public URLs)."""
+    client = _deepseek_client()
 
     content = [{"type": "text", "text": query}]
     for url in image_urls:
         content.append({"type": "image_url", "image_url": {"url": url}})
 
-    payload = {
-        "model": QWEN_MODEL,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 2048,  # adjust as needed
-    }
+    response = await client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[{"role": "user", "content": content}],
+        max_completion_tokens=DEEPSEEK_MAX_TOKENS,
+    )
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(chat_url, json=payload, headers=headers, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
-        choices = data.get("choices", [])
-        if not choices:
-            raise RuntimeError("No choices in Qwen VL response")
-        content = choices[0].get("message", {}).get("content", "")
-        if not content:
-            raise RuntimeError("Empty content in Qwen VL response")
-        return content
+    if not response.choices:
+        raise RuntimeError("No choices in DeepSeek response")
+    message = response.choices[0].message
+    if not message.content:
+        raise RuntimeError("Empty content in DeepSeek response")
+    return message.content
 
 
 async def vision_analyze(image_path: str, query: str = "Опиши, что изображено на этой картинке. Подробно, на русском.") -> str:
     """
-    Analyze a local image file using Qwen VL vision model.
+    Analyze a local image file using DeepSeek vision model.
 
     Args:
         image_path: Path to the image file on disk.
@@ -85,14 +83,14 @@ async def vision_analyze(image_path: str, query: str = "Опиши, что из�
     b64_str = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{b64_str}"
 
-    result = await _call_qwen_vl_multi([data_url], query)
+    result = await _call_deepseek_vision([data_url], query)
     logger.debug(f"vision_analyze returned: {result}")
     return result
 
 
 async def vision_analyze_url(image_url: str, query: str = "Опиши, что изображено на этой картинке. Подробно, на русском.") -> str:
     """
-    Analyze an image from a publicly accessible URL using Qwen VL vision model.
+    Analyze an image from a publicly accessible URL using DeepSeek vision model.
 
     Args:
         image_url: HTTP/HTTPS URL of the image.
@@ -103,7 +101,7 @@ async def vision_analyze_url(image_url: str, query: str = "Опиши, что и
     """
     logger.debug(f"vision_analyze_url called with url={image_url}, query={query}")
 
-    result = await _call_qwen_vl_multi([image_url], query)
+    result = await _call_deepseek_vision([image_url], query)
     logger.debug(f"vision_analyze_url returned: {result}")
     return result
 
@@ -177,7 +175,7 @@ async def analyze_dynamic_scene(
         if i < num_frames - 1:
             await asyncio.sleep(interval_seconds)
 
-    result = await _call_qwen_vl_multi(image_urls, query)
+    result = await _call_deepseek_vision(image_urls, query)
     logger.debug(f"analyze_dynamic_scene result: {result}")
     return result
 
@@ -241,7 +239,7 @@ TOOL_DEFINITIONS = [
     (
         "vision_analyze",
         vision_analyze,
-        "Analyze a local image file using Qwen VL vision model",
+        "Analyze a local image file using DeepSeek vision model",
         {
             "type": "object",
             "properties": {
@@ -261,7 +259,7 @@ TOOL_DEFINITIONS = [
     (
         "vision_analyze_url",
         vision_analyze_url,
-        "Analyze an image from URL using Qwen VL vision model",
+        "Analyze an image from URL using DeepSeek vision model",
         {
             "type": "object",
             "properties": {

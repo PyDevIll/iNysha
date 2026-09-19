@@ -93,8 +93,8 @@ async def fs_read(file: str, lines: int = 30, start: int = 1) -> str:
     p = _safe_path(file)
     if not p.exists():
         return f"File not found: {file}"
-    if lines > 80:
-        lines = 80
+    if lines > 500:
+        lines = 500
     try:
         size = p.stat().st_size
     except OSError as e:
@@ -107,10 +107,10 @@ async def fs_read(file: str, lines: int = 30, start: int = 1) -> str:
         return f"Error reading file: {e}"
     all_lines = content.split('\n')
     total = len(all_lines)
-    if size > 50 * 1024:
+    if size > 128 * 1024:
         first = all_lines[:20]
         last = all_lines[-10:] if total >= 10 else []
-        out = [f"File is {human_size(size)} (>50KB). First 20 + last 10 lines:"]
+        out = [f"File is {human_size(size)} (>128KB, было 50). First 20 + last 10 lines:"]
         for i, line in enumerate(first, 1):
             out.append(f"{i:>6}: {line}")
         if total > 30:
@@ -188,7 +188,7 @@ async def fs_grep(
     max_files: int = 500,
     regex: bool = False,
     case_sensitive: bool = False,
-    max_size: int = 1_000_000,
+    max_size: int = 10_000_000,
     force_text: bool = False,
 ) -> str:
     """
@@ -201,7 +201,7 @@ async def fs_grep(
         max_files: Maximum number of files to scan (default: 500).
         regex: If True, treat pattern as a regular expression.
         case_sensitive: If True, perform case-sensitive search.
-        max_size: Maximum file size in bytes to read (0 = unlimited, default: 1MB).
+        max_size: Maximum file size in bytes to read (0 = unlimited, default: 10MB, было 1мб).
         force_text: If True, skip binary detection and read the file as text.
 
     Returns:
@@ -541,6 +541,32 @@ async def fs_append(file: str, content: str) -> str:
     return f"Appended to {file}"
 
 
+async def fs_read_docx(file: str, max_chars: int = 20000) -> str:
+    """Extract text from a .docx (Word) document using docxpy."""
+    p = _safe_path(file)
+    if not p.exists():
+        return f"File not found: {file}"
+    if p.suffix.lower() != '.docx':
+        return f"Not a .docx file: {file}"
+    try:
+        import docxpy
+    except ImportError:
+        return "docxpy is not installed. Run: pip install docxpy"
+
+    loop = asyncio.get_event_loop()
+    try:
+        text = await loop.run_in_executor(None, docxpy.process, str(p))
+    except Exception as e:
+        return f"Error reading docx: {e}"
+
+    if text is None:
+        text = ""
+    text = text.strip()
+    if max_chars and len(text) > max_chars:
+        return text[:max_chars] + f"\n...[truncated, total {len(text)} chars]"
+    return text
+
+
 TOOL_DEFINITIONS = [
     ("fs_tree", fs_tree, "Recursive directory listing with sizes and dates", {
         "type": "object",
@@ -651,6 +677,14 @@ TOOL_DEFINITIONS = [
             "content": {"type": "string", "description": "Content to append"},
         },
         "required": ["file", "content"],
+    }),
+    ("fs_read_docx", fs_read_docx, "Extract text from a .docx (Word) document using docxpy", {
+        "type": "object",
+        "properties": {
+            "file": {"type": "string", "description": "Path to the .docx file"},
+            "max_chars": {"type": "integer", "description": "Max characters to return (default: 20000)"},
+        },
+        "required": ["file"],
     }),
 ]
 

@@ -1,3 +1,11 @@
+import truststore
+truststore.inject_into_ssl()
+
+import ssl
+print("ssl module:", ssl.__file__)
+print("create_default_context:", ssl.create_default_context)
+print("load_default_certs module:", ssl.SSLContext.load_default_certs.__module__)
+
 import asyncio
 from dotenv import load_dotenv
 import app
@@ -58,6 +66,6 @@ if __name__ == "__main__":
     asyncio.run(main())
 
     # asyncio.run(test_get_yandex_models())
-    # asyncio.run(test_vision())
+    #asyncio.run(test_vision())
     # asyncio.run(test_screenshot())
     # asyncio.run(test_queue())

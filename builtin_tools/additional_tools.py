@@ -30,7 +30,7 @@ import subprocess
 # Maximum command-line length for CreateProcess on Windows
 _MAX_CMD_LEN = 32767
 
-async def exec_python(parameter: str, timeout: int = 30) -> str:
+async def exec_python(parameter: str, timeout: int = 90) -> str:
     """⚠️ WARNING: Full system access. Use ONLY on explicit user request.
 
     Execute arbitrary Python code.
@@ -121,7 +121,7 @@ async def exec_python(parameter: str, timeout: int = 30) -> str:
         }, ensure_ascii=False)
 
 
-async def exec_shell(command: str, timeout: int = 30) -> str:
+async def exec_shell(command: str, timeout: int = 90) -> str:
     """Execute arbitrary shell command on Windows 10 using cmd.exe /c.
 
     - Forces UTF-8 output via `chcp 65001`.
@@ -131,7 +131,7 @@ async def exec_shell(command: str, timeout: int = 30) -> str:
 
     Args:
         command: Shell command string (e.g., "dir /b", "ipconfig", "echo hello")
-        timeout: Execution timeout in seconds (default: 30)
+        timeout: Execution timeout in seconds (default: 90, было 30)
 
     Returns:
         JSON string with stdout, stderr, returncode

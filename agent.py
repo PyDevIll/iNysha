@@ -16,8 +16,7 @@ from context_manager import ContextPool
 from tool_registry import get_registry
 
 LLM_MAX_OUTPUT_TOKENS = 30000
-LLM_MODEL = "gpt://b1gd6m9pgdlccgn3of5i/aliceai-llm-flash/latest"
-
+LLM_MODEL = "gpt://b1gnlerh4pfcjm4hjko3/deepseek-v4-flash/latest"
 
 def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dict]:
     """Build base prompt messages from text/file tuples."""
@@ -35,7 +34,7 @@ def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dic
         content += "\n\n---\n\n"
         composed.append({
             "role": "system",
-            "name": "INYSHA",
+            "name": "Deliria",
             "content": content,
         })
     return composed
@@ -327,7 +326,7 @@ class Agent:
         Returns final response text.
         reasoning_callback: async callable(thought_text) for live reasoning output.
         """
-        max_iterations = 7
+        max_iterations = 15
         iteration = 0
         enable_reasoning = bool(reasoning_callback)
 

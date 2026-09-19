@@ -131,7 +131,7 @@ async def start_app():
     # Create main agent
     global agent
     agent = Agent(
-        name="INYSHA",
+        name="DELIRIA",
         base_prompts=[
             ("## **IDENTITY**\n", "system_prompts/core.md"),
             ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),

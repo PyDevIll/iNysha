@@ -118,7 +118,7 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 
 | Tool | Rating | Notes |
 |------|--------|-------|
-| `vision_analyze` | ★★★★☆ | **Analyze a local image file** using Qwen VL (`qwen3-vl-plus`). Takes `image_path` and optional `query`. Returns detailed description. Requires `QWEN_API_KEY` and `QWEN_API_ENDPOINT` env vars. |
+| `vision_analyze` | ★★★★☆ | **Analyze a local image file** using DeepSeek (`deepseek-flash`). Takes `image_path` and optional `query`. Returns detailed description. Requires `DEEPSEEK_API_KEY` and `DEEPSEEK_API_ENDPOINT` env vars. |
 | `vision_analyze_url` | ★★★★☆ | **Analyze an image from URL** — same model, same parameters. Fetches the image remotely. |
 
 ---
@@ -156,7 +156,7 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
         - Reply in-character as if you are speaking. No emojis, no descriptions and interludes - only spoken words.
         - Please, be **short**, when replying to `[Local mic]` messages and using `tts_speak_aloud` tool! 
 
-**Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL-based images, `analyze_dynamic_scene` to capture the screen in motion. Supported formats: JPEG, PNG, GIF, WEBP. Powered by Qwen VL (`qwen3-vl-plus`).
+**Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL-based images, `analyze_dynamic_scene` to capture the screen in motion. Supported formats: JPEG, PNG, GIF, WEBP. Powered by DeepSeek (`deepseek-flash`).
     - Ask a specific question in the `query` parameter, based on the context of the interaction, about what you expect to see in the given visual content. 
 
 **Scheduler:** use `schedule_task` for periodic/autonomous tasks. Tasks fire on the next user message after `delay_minutes`. Cancel with `cancel_scheduled_task`.
