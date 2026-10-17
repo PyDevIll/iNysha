@@ -24,6 +24,12 @@ from typing import Optional
 from loguru import logger
 
 from .fs_tools import _safe_path, _is_binary
+from lib import textio
+
+
+def _read_edit_text(p: Path, encoding: str = "") -> tuple[str, dict]:
+    """Lenient read for the edit tools (never raises on a stray non-UTF-8 byte)."""
+    return textio.read_text(p, encoding=encoding)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -551,12 +557,12 @@ async def fs_aedit(
     file_exists = p.exists()
 
     if file_exists and _is_binary(str(p)):
-        return "ERROR: Cannot edit binary file"
+        return "ERROR: Cannot edit binary file (use fs_repair_encoding if it is text in another encoding)"
 
     # Read current content
     if file_exists:
         try:
-            content = p.read_text(encoding="utf-8")
+            content, _meta = _read_edit_text(p)
         except Exception as e:
             return f"ERROR reading file: {e}"
     else:
@@ -638,11 +644,11 @@ async def fs_apply_patch(
     p = _safe_path(file)
 
     if p.exists() and _is_binary(str(p)):
-        return "ERROR: Cannot patch binary file"
+        return "ERROR: Cannot patch binary file (use fs_repair_encoding if it is text in another encoding)"
 
     if p.exists():
         try:
-            content = p.read_text(encoding="utf-8")
+            content, _meta = _read_edit_text(p)
         except Exception as e:
             return f"ERROR reading file: {e}"
     else:
@@ -669,7 +675,7 @@ async def fs_apply_patch(
 
         if target_path.exists():
             try:
-                target_content = target_path.read_text(encoding="utf-8")
+                target_content, _meta = _read_edit_text(target_path)
             except Exception as e:
                 errors.append(f"ERROR reading {target}: {e}")
                 failed += 1
@@ -732,7 +738,7 @@ async def fs_write_file(
     p = _safe_path(file)
     old_size = 0
     if p.exists():
-        old_size = len(p.read_text(encoding="utf-8"))
+        old_size = len(_read_edit_text(p)[0])
 
     if dry_run:
         return f"[DRY RUN] Would write {file} ({old_size}→{len(content)} chars)"
@@ -750,6 +756,7 @@ async def fs_edit_blocks(
     blocks: str,
     dry_run: bool = False,
     fuzzy: bool = True,
+    file: str = "",
 ) -> str:
     """Parse and apply multiple SEARCH/REPLACE blocks from LLM output.
 
@@ -767,9 +774,12 @@ async def fs_edit_blocks(
         blocks: String containing one or more SEARCH/REPLACE blocks
         dry_run: If true, return what would be changed without writing
         fuzzy: Enable fuzzy matching
+        file: Target file — like the sibling edit tools (``fs_edit``/``fs_aedit``).
+            When given and the blocks carry no filename header, it is applied to
+            every block.
 
     Returns:
-        Summary of all edit operations.
+        Summary of all edit operations, with a ``changed`` flag.
     """
     edits = find_edit_blocks(blocks)
 
@@ -778,6 +788,9 @@ async def fs_edit_blocks(
                 "Use format:\n"
                 "  path/to/file\n"
                 "  <<<<<<< SEARCH\n  old_code\n  =======\n  new_code\n  >>>>>>> REPLACE")
+
+    if file and all(not fname for fname, _, _ in edits):
+        edits = [(file, search_text, replace_text) for _, search_text, replace_text in edits]
 
     results = []
     succeeded = 0
@@ -797,16 +810,20 @@ async def fs_edit_blocks(
             fuzzy=fuzzy,
         )
 
-        if result.startswith("ERROR"):
-            failed += 1
-        else:
+        # A match failure is not an "ERROR" string — check both, otherwise a
+        # failed block was miscounted as applied (R18).
+        ok = not (result.startswith("ERROR") or result.startswith("SEARCH block failed"))
+        if ok:
             succeeded += 1
+        else:
+            failed += 1
         results.append(f"  {fname}: {result}")
 
-    header = f"Applied {succeeded}/{len(edits)} edit blocks"
+    changed = succeeded > 0 and not dry_run
+    header = f"Applied {succeeded}/{len(edits)} edit blocks ({failed} failed)"
     if dry_run:
         header = "[DRY RUN] " + header
-    return header + "\n" + "\n".join(results)
+    return header + f"\nchanged: {str(changed).lower()}\n" + "\n".join(results)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -998,10 +1015,10 @@ async def fs_edit_diff(
     if not p.exists():
         return f"ERROR: File {file} does not exist"
     if _is_binary(str(p)):
-        return "ERROR: Cannot edit binary file"
+        return "ERROR: Cannot edit binary file (use fs_repair_encoding if it is text in another encoding)"
 
     try:
-        content = p.read_text(encoding=encoding)
+        content, _meta = _read_edit_text(p, encoding=encoding)
     except Exception as e:
         return f"ERROR reading file: {e}"
 
@@ -1028,7 +1045,7 @@ async def fs_edit_diff(
         return f"[DRY RUN] Would edit {file}: {len(hunks)} hunk(s) applied"
 
     try:
-        p.write_text(new_content, encoding=encoding)
+        textio.write_text(p, new_content)
     except Exception as e:
         return f"ERROR writing file: {e}"
 
@@ -1061,10 +1078,10 @@ async def fs_edit(
     if not p.exists():
         return f"ERROR: File {file} does not exist"
     if _is_binary(str(p)):
-        return "ERROR: Cannot edit binary file"
+        return "ERROR: Cannot edit binary file (use fs_repair_encoding if it is text in another encoding)"
 
     try:
-        content = p.read_text(encoding=encoding)
+        content, _meta = _read_edit_text(p, encoding=encoding)
     except Exception as e:
         return f"ERROR reading file: {e}"
 
@@ -1085,7 +1102,7 @@ async def fs_edit(
         return f"[DRY RUN] Would edit {file} (search/replace)"
 
     try:
-        p.write_text(new_content, encoding=encoding)
+        textio.write_text(p, new_content)
     except Exception as e:
         return f"ERROR writing file: {e}"
 
@@ -1131,6 +1148,7 @@ TOOL_DEFINITIONS = [
         "type": "object",
         "properties": {
             "blocks": {"type": "string", "description": "String with SEARCH/REPLACE blocks (filename + <<<<<<< SEARCH / ======= / >>>>>>> REPLACE)"},
+            "file": {"type": "string", "description": "Target file (used when blocks carry no filename header)"},
             "dry_run": {"type": "boolean", "description": "Preview changes without writing (default: false)"},
             "fuzzy": {"type": "boolean", "description": "Enable fuzzy matching (default: true)"},
         },
@@ -1161,8 +1179,11 @@ TOOL_DEFINITIONS = [
 ]
 
 
+GROUP = "edit"
+
+
 def register_all(registry):
     """Register all edit tools with the given registry."""
     for name, func, desc, params in TOOL_DEFINITIONS:
-        registry.register_function(func, name, desc, params)
+        registry.register_function(func, name, desc, params, group=GROUP)
     logger.info(f"Registered {len(TOOL_DEFINITIONS)} edit tools")

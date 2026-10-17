@@ -9,6 +9,11 @@ Layers (ordered by proximity to LLM):
   L2_MASKED      — older tool outputs replaced with [MASKED: ...]
   L3_COMPRESSED  — LLM-summarized batches (last resort)
   LX_PERSISTENT  — key facts surviving across sessions
+
+The assembled prompt is kept **append-only** as long as possible so the
+provider's prefix cache keeps hitting (see the Constants block): the
+masked/sliding boundary moves only in ``MASK_BATCH_SIZE`` steps, and compression
+(which rewrites the tail) is deferred to ``COMPRESS_TRIGGER_RATIO``.
 """
 
 from __future__ import annotations
@@ -56,15 +61,23 @@ def count_tokens(text: str) -> int:
 
 
 # ── Constants ──────────────────────────────────────────────────────────
-DEFAULT_MAX_TOKENS = 500000          # soft cap; proactive trim at 80%
-SLIDING_WINDOW_SIZE = 20            # last N messages kept verbatim
-MASK_BATCH_SIZE = 20                 # mask tool outputs older than this many msgs
-COMPRESSION_BATCH = 50              # trigger LLM summarization every N messages
+#
+# Cache-stability note: providers bill/hit a **prefix cache** — identical leading
+# messages are reused (Groq: cached input tokens don't count against the rate
+# limits). The assembled prompt must therefore be **append-only** between
+# rewrites. Two things break the prefix: (1) moving the masked/sliding boundary
+# (handled by MASK_BATCH_SIZE), and (2) compression, which rewrites the whole
+# tail (deferred via the high trigger ratios below).
+
+DEFAULT_MAX_TOKENS = 150000          # soft cap; proactive trim at COMPRESS_TRIGGER_RATIO
+SLIDING_WINDOW_SIZE = 20             # min messages kept verbatim (sliding-window floor)
+MASK_BATCH_SIZE = 25                 # masked/sliding boundary moves in steps of this many
+COMPRESSION_BATCH = 50               # legacy count trigger (compression is token-driven)
 PERSISTENT_FILE = "persistent_memory.json"
 EMERGENCY_FILE = "emergency_save.json"
-MAX_COMPRESSED_DICTS = 16            # merge compressed summaries when exceeding this
-OVERFLOW_RATIO = 0.70               # overflow flag when assembled context >= this share
-COMPRESS_TRIGGER_RATIO = 0.70       # compress when assembled context >= this share
+MAX_COMPRESSED_DICTS = 32            # merge compressed summaries when exceeding this
+OVERFLOW_RATIO = 0.90                # overflow flag when assembled context >= this share
+COMPRESS_TRIGGER_RATIO = 0.90        # compress when assembled context >= this share
 MAX_SUMMARY_CHARS = 4000            # warn when a single summary is larger than this
 MAX_NARRATIVE_CHARS = 500           # narrative is capped to ~1-2 sentences
 
@@ -292,10 +305,12 @@ class ContextPool:
         self,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         window_size: int = SLIDING_WINDOW_SIZE,
+        mask_batch_size: int = MASK_BATCH_SIZE,
         data_dir: Optional[Path] = None,
     ):
         self.max_tokens = max_tokens
         self.window_size = window_size
+        self.mask_batch_size = max(1, int(mask_batch_size))
         self._data_dir = data_dir or DATA_DIR
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -328,17 +343,33 @@ class ContextPool:
         return [self._entry_to_openai_dict(e) for e in self.sliding_window]
 
     @property
+    def _split(self) -> int:
+        """Index where the verbatim sliding window starts (older entries masked).
+
+        Quantized to ``mask_batch_size`` so the boundary only moves every
+        ``mask_batch_size`` messages. Between moves the assembled prompt is
+        strictly **append-only** (masked entries unchanged, sliding entries
+        appended), so the provider's prefix cache stays valid and only the new
+        tail is uncached. Moving the boundary by one message per turn — as a raw
+        ``len - window_size`` split does — re-represents one entry and
+        invalidates the cached suffix on every single turn.
+        """
+        n = len(self._all_entries)
+        if n <= self.window_size:
+            return 0
+        return ((n - self.window_size) // self.mask_batch_size) * self.mask_batch_size
+
+    @property
     def sliding_window(self) -> list[MemoryEntry]:
-        """Last N entries in full detail."""
-        return self._all_entries[-self.window_size:] if self._all_entries else []
+        """Recent entries kept verbatim (at least ``window_size``)."""
+        if not self._all_entries:
+            return []
+        return self._all_entries[self._split:]
 
     @property
     def masked_entries(self) -> list[MemoryEntry]:
-        """Entries older than sliding window, with tool outputs masked."""
-        if len(self._all_entries) <= self.window_size:
-            return []
-        older = self._all_entries[: -self.window_size]
-        return [self._masker.mask(e) for e in older]
+        """Entries older than the sliding window, with tool outputs masked."""
+        return [self._masker.mask(e) for e in self._all_entries[: self._split]]
 
     @property
     def length(self) -> int:
@@ -447,21 +478,27 @@ class ContextPool:
         )
 
     # ── Compression ────────────────────────────────────────────────
-    async def compress(self, helper_agent) -> Optional[str]:
-        """LLM summarization — last resort for large batches (structured output + narrative)."""
+    async def compress(self, helper_agent, force: bool = False) -> Optional[str]:
+        """LLM summarization — last resort for large batches (structured output + narrative).
+
+        ``force=True`` (manual ``/compress``) bypasses the token-ratio gate but
+        still needs at least two entries beyond the sliding window to summarize.
+        """
         async with self._compress_lock:
             self.log_state("BEFORE compression")
 
             assembled = self.get_assembled_tokens()
             overflow_ratio = assembled / self.max_tokens if self.max_tokens > 0 else 0
-            old_count = len(self._all_entries) - self.window_size
+            split = self._split
+            old_count = split
 
             if not helper_agent:
                 return None
-            # Compress ONLY when the assembled context (all layers + base prompts)
-            # is genuinely near the budget, and there is something older than the
-            # sliding window to summarize. Never on message count alone.
-            if overflow_ratio < COMPRESS_TRIGGER_RATIO:
+            # Compress when the assembled context (all layers + base prompts) is
+            # genuinely near the budget, and there is something older than the
+            # sliding window to summarize. Never on message count alone, unless
+            # explicitly forced.
+            if not force and overflow_ratio < COMPRESS_TRIGGER_RATIO:
                 return None
             if old_count < 2:
                 return None
@@ -471,8 +508,8 @@ class ContextPool:
                 f"({overflow_ratio:.0%} of {self.max_tokens}), {len(self._all_entries)} entries"
             )
 
-            # Take the oldest batch beyond sliding window
-            batch = self._all_entries[: -self.window_size]
+            # Take the oldest batch (everything below the sliding boundary)
+            batch = self._all_entries[:split]
             if not batch:
                 return None
 
@@ -529,8 +566,8 @@ class ContextPool:
                 f"content length={len(compressed_text)}"
             )
 
-            # Trim old entries: keep only last window_size
-            kept = self._all_entries[-self.window_size:]
+            # Keep the sliding window; the batch is replaced by the summary.
+            kept = self._all_entries[split:]
             self._all_entries = kept
             self._token_counts.clear()
             # No orphan deletion – tool messages are kept.
@@ -703,6 +740,21 @@ class ContextPool:
             logger.exception(f"Background compression failed: {e}")
         finally:
             self._compression_task = None  # allow new runs
+
+
+    async def await_compression(self) -> None:
+        """Wait for an in-flight background compression, if any.
+
+        A background task trims ``_all_entries`` while the worker is idle; the
+        next run awaits it first so it never appends while the log is being
+        rewritten.
+        """
+        task = self._compression_task
+        if task is not None and not task.done():
+            try:
+                await task
+            except Exception as e:
+                logger.warning(f"await_compression: task ended with error: {e}")
 
 
     # ── Crash Recovery ─────────────────────────────────────────────
@@ -964,7 +1016,8 @@ class ContextPool:
     def log_state(self, tag: str = "") -> None:
         logger.info(f"=== Context state {tag} ===")
         logger.info(f"  Total entries: {len(self._all_entries)}")
-        logger.info(f"  Sliding window (last {self.window_size}): {len(self.sliding_window)} entries")
+        logger.info(f"  Sliding window (>= {self.window_size}, step {self.mask_batch_size}): "
+                    f"{len(self.sliding_window)} entries | boundary={self._split}")
         if self.sliding_window:
             first = self.sliding_window[0]
             last = self.sliding_window[-1]
