@@ -14,7 +14,8 @@ from agent import Agent
 from lib.max_bot import MAXBot
 from server import config
 from server.context import RequestContext, current_request
-from server.queue import RequestQueue
+from server.queue import Request, RequestQueue
+from server.routing import MaxReply, NullReply
 from tool_registry import get_registry
 
 HELPER_PROMPT = """## Values:
@@ -35,6 +36,45 @@ def configure_logging() -> None:
         level="DEBUG",
         enqueue=True,
     )
+
+
+async def scheduler_loop(rt: "Runtime", tick: float = 15.0) -> None:
+    """Autonomously fire due scheduled tasks into the queue.
+
+    Without this loop ``schedule_task`` only stores a task and waits for the
+    next incoming message; here the scheduler itself pushes a ``Request`` so
+    the agent wakes up on time with no external trigger.
+    """
+    from lib.scheduler import get_scheduler
+
+    while True:
+        try:
+            await asyncio.sleep(tick)
+            sched = get_scheduler()
+            for task in sched.get_due_tasks():
+                chat_id = task.get("chat_id")
+                reply = (
+                    MaxReply(rt.bot, chat_id)
+                    if (chat_id and rt.bot is not None)
+                    else NullReply()
+                )
+                req = Request(
+                    text=task["prompt"],
+                    source="scheduled",
+                    chat_id=chat_id,
+                    trusted=True,
+                    reply=reply,
+                )
+                sched.mark_done(task["id"])
+                await rt.queue.put(req)
+                logger.info(
+                    f"[{req.id}] scheduled task {task['id']} fired "
+                    f"(queue left={rt.queue.qsize()})"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("scheduler loop iteration failed")
 
 
 async def worker_loop(rt: "Runtime") -> None:
@@ -91,6 +131,7 @@ class Runtime:
         self.queue = RequestQueue()
         self.worker_task: asyncio.Task | None = None
         self.poll_task: asyncio.Task | None = None
+        self.scheduler_task: asyncio.Task | None = None
         self.started = False
         self.started_at = 0.0
         self.max_username: str | None = None
@@ -154,6 +195,9 @@ class Runtime:
             logger.exception("MAX bot identity check failed")
 
         self.worker_task = asyncio.create_task(worker_loop(self), name="inysha-worker")
+        self.scheduler_task = asyncio.create_task(
+            scheduler_loop(self), name="inysha-scheduler"
+        )
 
         if config.MAX_TRANSPORT == "poll":
             from server.sources.max_poll import poll_max_updates
@@ -179,6 +223,12 @@ class Runtime:
             with suppress(asyncio.CancelledError):
                 await self.worker_task
             self.worker_task = None
+
+        if self.scheduler_task is not None:
+            self.scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.scheduler_task
+            self.scheduler_task = None
 
         if self.poll_task is not None:
             self.poll_task.cancel()
