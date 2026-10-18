@@ -1,0 +1,294 @@
+"""Low-latency voice WebSocket for desktop clients.
+
+The protocol mirrors the working max-voice-assistant mini-app:
+
+    client -> server: {"action": "listen_start" | "stop" | "playback_done"}
+    client -> server: raw 16 kHz / 16-bit / mono PCM frames
+    server -> client: {"type": "ready" | "vad" | "status" | "stt" |
+                              "final" | "error" | "done"}
+    server -> client: raw 16 kHz / 16-bit / mono PCM (ElevenLabs)
+
+VAD and STT run on the server, so the client stays a thin microphone/speaker
+body.  The shared agent queue is used for the reasoning turn, keeping one
+serialized context across MAX, API and desktop voice clients.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import time
+from contextlib import suppress
+from typing import Any
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from loguru import logger
+
+from lib.elevenlabs_tts import stream_pcm
+from server import config
+from server.audio import (
+    MIN_AUDIO_BYTES,
+    SILENCE_RMS_THRESHOLD,
+    is_likely_hallucination,
+    pcm_rms,
+    sanitize_for_tts,
+    transcribe_pcm,
+)
+from server.queue import Request
+from server.routing import FutureReply
+from server.runtime import runtime
+from server.vad import VadSegmenter
+
+router = APIRouter(tags=["voice"])
+
+FRAME_SECONDS = 0.03
+
+
+async def _authenticate(websocket: WebSocket) -> dict[str, Any] | None:
+    if not config.CLIENT_TOKEN:
+        await websocket.close(code=1011, reason="CLIENT_TOKEN is not configured")
+        return None
+    try:
+        hello = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+    except Exception:
+        await websocket.close(code=4001, reason="Expected hello message")
+        return None
+    if hello.get("type") != "hello":
+        await websocket.close(code=4001, reason="Expected hello message")
+        return None
+    token = str(hello.get("token") or "")
+    if not hmac.compare_digest(token, config.CLIENT_TOKEN):
+        logger.warning("voice client authentication failed")
+        await websocket.close(code=4001, reason="Authentication failed")
+        return None
+    return hello
+
+
+@router.websocket("/ws/voice")
+async def voice_ws(websocket: WebSocket) -> None:
+    await websocket.accept()
+    hello = await _authenticate(websocket)
+    if hello is None:
+        return
+
+    client_id = str(hello.get("client_id") or "voice-client")
+    name = str(hello.get("name") or client_id)
+    send_lock = asyncio.Lock()
+
+    async def send_json(payload: dict[str, Any]) -> None:
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    async def send_bytes(data: bytes) -> None:
+        async with send_lock:
+            await websocket.send_bytes(data)
+
+    logger.info(f"voice client connected: {client_id!r} ({name})")
+    await send_json({"type": "ready", "client_id": client_id, "name": name})
+
+    segmenter = VadSegmenter(
+        aggressiveness=2,
+        preroll_ms=400,
+        min_speech_ms=250,
+        hangover_ms=700,
+        max_speech_ms=config.VOICE_MAX_SECONDS * 1000,
+    )
+    session_open = False
+    accept_audio = False
+    turn_task: asyncio.Task | None = None
+
+    async def run_turn(pcm: bytes) -> None:
+        """STT -> shared agent queue -> streaming TTS."""
+        started = time.time()
+        try:
+            if (
+                len(pcm) < MIN_AUDIO_BYTES
+                or pcm_rms(pcm) < SILENCE_RMS_THRESHOLD
+            ):
+                await send_json({"type": "status", "status": "no_speech"})
+                await send_json(
+                    {"type": "done", "elapsed": time.time() - started}
+                )
+                return
+
+            await send_json({"type": "status", "status": "stt"})
+            try:
+                transcript = await transcribe_pcm(pcm, config.VOICE_SAMPLE_RATE)
+            except Exception as exc:
+                logger.exception("voice STT failed")
+                await send_json(
+                    {"type": "error", "message": f"STT error: {exc}"}
+                )
+                await send_json(
+                    {"type": "done", "elapsed": time.time() - started}
+                )
+                return
+
+            if not transcript or is_likely_hallucination(transcript):
+                logger.info(f"voice {client_id}: no usable transcript")
+                await send_json({"type": "status", "status": "no_speech"})
+                await send_json(
+                    {"type": "done", "elapsed": time.time() - started}
+                )
+                return
+
+            logger.info(
+                f"voice {client_id}: transcript ({len(transcript)} chars) "
+                f"{transcript[:120]!r}"
+            )
+            await send_json({"type": "stt", "text": transcript})
+
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[str] = loop.create_future()
+            header = (
+                f"[Voice client: {name} | client_id={client_id} | "
+                f"trusted={'true' if config.CLIENT_TRUSTED else 'false'}]"
+            )
+            request = Request(
+                text=f"{header}\n{transcript}",
+                source="voice",
+                client_id=client_id,
+                trusted=config.CLIENT_TRUSTED,
+                reply=FutureReply(future),
+            )
+            await runtime.queue.put(request)
+            logger.info(
+                f"[{request.id}] queued voice turn from client {client_id} "
+                f"(queue left={runtime.queue.qsize()})"
+            )
+
+            try:
+                answer = await asyncio.wait_for(
+                    future, timeout=config.VOICE_TURN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                await send_json(
+                    {"type": "error", "message": "agent turn timed out"}
+                )
+                await send_json(
+                    {"type": "done", "elapsed": time.time() - started}
+                )
+                return
+            except Exception as exc:
+                logger.exception(f"voice agent turn failed for {client_id}")
+                await send_json({"type": "error", "message": str(exc)})
+                await send_json(
+                    {"type": "done", "elapsed": time.time() - started}
+                )
+                return
+
+            answer = (answer or "").strip()
+            await send_json({"type": "final", "text": answer})
+            speech = sanitize_for_tts(answer)
+            if not speech:
+                await send_json(
+                    {"type": "done", "elapsed": time.time() - started}
+                )
+                return
+
+            await send_json({"type": "status", "status": "tts"})
+            bytes_sent = 0
+            try:
+                async for chunk in stream_pcm(
+                    speech,
+                    output_format=config.VOICE_TTS_FORMAT,
+                    optimize_streaming_latency=config.VOICE_TTS_LATENCY,
+                ):
+                    bytes_sent += len(chunk)
+                    await send_bytes(chunk)
+            except Exception as exc:
+                logger.exception("voice TTS streaming failed")
+                await send_json(
+                    {"type": "error", "message": f"TTS error: {exc}"}
+                )
+
+            logger.info(
+                f"voice {client_id}: answer {len(answer)} chars, "
+                f"TTS {bytes_sent} bytes PCM"
+            )
+            await send_json(
+                {"type": "done", "elapsed": time.time() - started}
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f"voice turn failed for {client_id}")
+            with suppress(Exception):
+                await send_json(
+                    {"type": "error", "message": "voice pipeline failed"}
+                )
+                await send_json(
+                    {"type": "done", "elapsed": time.time() - started}
+                )
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if message["type"] != "websocket.receive":
+                continue
+
+            if "bytes" in message and message["bytes"] is not None:
+                if not accept_audio:
+                    continue
+                for event in segmenter.feed(message["bytes"]):
+                    if event["type"] == "speech_start":
+                        await send_json(
+                            {"type": "vad", "event": "speech_start"}
+                        )
+                    elif event["type"] == "speech_end":
+                        accept_audio = False
+                        await send_json(
+                            {"type": "vad", "event": "speech_end"}
+                        )
+                        if turn_task is None or turn_task.done():
+                            turn_task = asyncio.create_task(
+                                run_turn(event["audio"]),
+                                name=f"voice-turn-{client_id}",
+                            )
+                continue
+
+            if "text" not in message or message["text"] is None:
+                continue
+
+            import json
+
+            try:
+                data = json.loads(message["text"])
+            except Exception:
+                continue
+            action = data.get("action")
+
+            if action == "listen_start":
+                session_open = True
+                if turn_task is not None and not turn_task.done():
+                    turn_task.cancel()
+                segmenter.reset()
+                accept_audio = True
+                logger.debug(f"voice {client_id}: listening")
+
+            elif action == "stop":
+                session_open = False
+                accept_audio = False
+                segmenter.reset()
+                if turn_task is not None and not turn_task.done():
+                    turn_task.cancel()
+                logger.debug(f"voice {client_id}: stopped")
+
+            elif action == "playback_done":
+                if session_open and (turn_task is None or turn_task.done()):
+                    segmenter.reset()
+                    accept_audio = True
+                    logger.debug(f"voice {client_id}: playback done, listening")
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception(f"voice socket failed for {client_id}")
+    finally:
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await turn_task
+        logger.info(f"voice client disconnected: {client_id!r} ({name})")

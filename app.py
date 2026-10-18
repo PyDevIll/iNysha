@@ -126,6 +126,7 @@ async def start_app():
     - Concise: Return only processed content. No questions.""",
         use_tools=False,
         save_history=False,
+        api_key=os.getenv("DEEPSEEK_API_KEY_HELPER") or None,
     )
 
     # Create main agent

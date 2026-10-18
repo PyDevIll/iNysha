@@ -15,8 +15,17 @@ from loguru import logger
 from context_manager import ContextPool
 from tool_registry import get_registry
 
-LLM_MAX_OUTPUT_TOKENS = 30000
-LLM_MODEL = "gpt://b1gnlerh4pfcjm4hjko3/deepseek-v4-flash/latest"
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "30000"))
+
+
+def _resolve_base_url() -> str:
+    return (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+
+
+def _resolve_model() -> str:
+    raw = (os.getenv("DEEPSEEK_MODEL") or "deepseek-flash").strip() or "deepseek-flash"
+    # The API uses hyphens ("deepseek-flash"); accept the underscore spelling too.
+    return raw.replace("_", "-")
 
 def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dict]:
     """Build base prompt messages from text/file tuples."""
@@ -77,12 +86,19 @@ class Agent:
         last_memory: Optional[list] = None,
         use_tools: bool = True,
         save_history: bool = True,
-        base_url: str = "https://ai.api.cloud.yandex.net/v1",
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
     ):
         self.name = name
-        # api_key = os.environ.get(f'DEEPSEEK_API_KEY_{self.name}') or os.environ.get('DEEPSEEK_API_KEY', '')
-        api_key = os.getenv("YANDEXGPT_API_KEY")
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._max_tokens = int(
+            os.getenv("LLM_MAX_OUTPUT_TOKENS", str(LLM_MAX_OUTPUT_TOKENS))
+        )
+        self._client = AsyncOpenAI(
+            api_key=api_key or os.getenv("DEEPSEEK_API_KEY", ""),
+            base_url=base_url or _resolve_base_url(),
+        )
+        self._model = model or _resolve_model()
         self._system_prompt = {"role": "system", "name": "Creator", "content": system_prompt}
         self._base_prompts = base_prompts or []
         self._last_memory = last_memory or []
@@ -95,7 +111,7 @@ class Agent:
         if self._last_memory:
             self.messages.assign_messages(construct_history(self._last_memory))
 
-        logger.info(f"Agent '{name}' initialized ({LLM_MODEL}), "
+        logger.info(f"Agent '{name}' initialized ({self._model}), "
                      f"crash recovery: {self.messages.length > 0}")
 
     def add_helper_agent(self, helper: Agent) -> None:
@@ -294,13 +310,15 @@ class Agent:
 
         try:
             response = await self._client.chat.completions.create(
-                model=LLM_MODEL,
+                model=self._model,
                 messages=messages,
                 tools=tools or None,
                 stream=False,
-                max_tokens=LLM_MAX_OUTPUT_TOKENS,
+                max_tokens=self._max_tokens,
                 temperature=1.0,
-                # extra_body={"thinking": {"type": "enabled"} if enable_reasoning else {"type": "disabled"}}
+                extra_body={
+                    "thinking": {"type": "enabled" if enable_reasoning else "disabled"}
+                },
             )
         except Exception as e:
             logger.exception(f"LLM API call failed: {e}")

@@ -21,6 +21,7 @@ class ToolDef:
     func: Callable
     parameters: dict = field(default_factory=dict)
     module_name: str = ""
+    group: str = ""
 
 
 class ToolRegistry:
@@ -60,6 +61,7 @@ class ToolRegistry:
         name: str,
         description: str,
         parameters: Optional[dict] = None,
+        group: str = "",
     ) -> Callable:
         """Decorator to register an async tool function."""
         def wrapper(func: Callable) -> Callable:
@@ -69,6 +71,7 @@ class ToolRegistry:
             self._tools[name] = ToolDef(
                 name=name, description=description,
                 func=func, parameters=parameters or {}, module_name=module_name,
+                group=group,
             )
             self._version += 1
             logger.debug(f"Registered tool: {name} from {module_name}")
@@ -78,12 +81,13 @@ class ToolRegistry:
 
     def register_function(
         self, func: Callable, name: str, description: str,
-        parameters: Optional[dict] = None,
+        parameters: Optional[dict] = None, group: str = "",
     ) -> None:
         module_name = func.__module__
         self._tools[name] = ToolDef(
             name=name, description=description,
             func=func, parameters=parameters or {}, module_name=module_name,
+            group=group,
         )
 
 

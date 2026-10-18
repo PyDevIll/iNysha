@@ -11,6 +11,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Callable, Awaitable, Any, Dict, List, Union
 
+import truststore
+
+truststore.inject_into_ssl()
+
 import httpx
 from loguru import logger
 import hashlib
@@ -19,8 +23,8 @@ import urllib.parse
 
 # ---------- Constants ----------
 MAX_API_URL = "https://platform-api2.max.ru"
-MAX_API_VERSION = "v1"
 RETRY_INTERVAL = 5  # seconds
+LONG_POLL_TIMEOUT = 30  # seconds
 
 
 def _safe_filename_from_token(token: str, content_type: str = "") -> str:
@@ -309,7 +313,7 @@ class MAXBotApi:
                     "Content-Type": "application/json",
                 },
                 timeout=70.0,
-                verify=False
+                verify=True
             )
         return self._client
 
@@ -346,11 +350,11 @@ class MAXBotApi:
     # ---------- Bot API ----------
     async def get_my_info(self) -> Dict[str, Any]:
         """Get bot information."""
-        return await self._request("GET", "/bots/me")
+        return await self._request("GET", "/me")
 
     async def edit_my_info(self, **kwargs) -> Dict[str, Any]:
         """Edit bot information."""
-        return await self._request("PUT", "/bots/me", body=kwargs)
+        return await self._request("PATCH", "/me", body=kwargs)
 
     # ---------- Chat API ----------
     async def get_all_chats(self, **kwargs) -> Dict[str, Any]:
@@ -495,58 +499,93 @@ class MAXBotApi:
         if not path.exists():
             return {"ok": False, "error": f"File not found: {file_path}"}
 
-        client = await self._get_client()
-        try:
-            # Step 1: Get upload URL from MAX API
-            response = await client.post(
-                "/uploads",
-                params={"type": file_type},
-            )
-            response.raise_for_status()
-            upload_info = response.json()
-        except Exception as e:
-            logger.error(f"getUploadUrl error: {e}")
-            return {"ok": False, "error": f"getUploadUrl failed: {e}"}
-
-        upload_url = upload_info.get("url")
-        if not upload_url:
-            return {"ok": False, "error": "No upload URL in response"}
-
-        token = upload_info.get("token")  # obtained here
-
-        # Step 2: Upload file to CDN
         file_bytes = await asyncio.to_thread(path.read_bytes)
         file_name = path.name
+        content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
 
-        try:
-            async with httpx.AsyncClient(verify=False, timeout=70.0) as upload_client:
-                upload_resp = await upload_client.post(
-                    upload_url,
-                    files={"data": (file_name, file_bytes)},
+        client = await self._get_client()
+        last_error: Optional[Exception] = None
+
+        # A failed CDN upload can be transient; request a fresh upload URL and
+        # retry once.  Each /uploads URL is single-use.
+        for attempt in range(2):
+            try:
+                response = await client.post(
+                    "/uploads",
+                    params={"type": file_type},
+                    timeout=20.0,
                 )
-                upload_resp.raise_for_status()
+                response.raise_for_status()
+                upload_info = response.json()
+            except Exception as e:
+                logger.error(f"getUploadUrl error: {e}")
+                return {"ok": False, "error": f"getUploadUrl failed: {e}"}
+
+            upload_url = upload_info.get("url")
+            if not upload_url:
+                return {"ok": False, "error": "No upload URL in response"}
+
+            token = upload_info.get("token")
+
+            # The CDN URL is occasionally not ready immediately after
+            # /uploads.  A short delay avoids intermittent upload failures.
+            await asyncio.sleep(1)
+
+            try:
+                async with httpx.AsyncClient(
+                    verify=True,
+                    timeout=30.0,
+                    follow_redirects=True,
+                ) as upload_client:
+                    upload_resp = await upload_client.post(
+                        upload_url,
+                        files={
+                            "data": (
+                                file_name,
+                                file_bytes,
+                                content_type,
+                            )
+                        },
+                    )
+
+                if upload_resp.status_code >= 400:
+                    body = upload_resp.text[:500]
+                    logger.error(
+                        f"CDN upload HTTP {upload_resp.status_code}: {body}"
+                    )
+                    upload_resp.raise_for_status()
+
                 cdn_body = upload_resp.text.strip()
 
-            # Try to get token from CDN response body (for file type where step 1 has no token)
-            cdn_token = None
-            if cdn_body:
-                try:
-                    cdn_data = json.loads(cdn_body)
-                    cdn_token = cdn_data.get("token")
-                except (json.JSONDecodeError, TypeError):
-                    pass  # XML or other format, ignore
+                # Try to get token from CDN response body (some upload types
+                # return it only after the binary upload).
+                cdn_token = None
+                if cdn_body:
+                    try:
+                        cdn_data = json.loads(cdn_body)
+                        cdn_token = cdn_data.get("token")
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # XML/plain response, ignore
 
-            return {
-                "ok": True,
-                "result": {
-                    "token": token or cdn_token,  # step 1 token first, CDN token fallback
-                    "file_name": file_name,
-                    "file_size": len(file_bytes),
+                return {
+                    "ok": True,
+                    "result": {
+                        "token": token or cdn_token,
+                        "file_name": file_name,
+                        "file_size": len(file_bytes),
+                    },
                 }
-            }
-        except Exception as e:
-            logger.error(f"CDN upload error: {e}")
-            return {"ok": False, "error": f"CDN upload failed: {e}"}
+            except Exception as e:
+                last_error = e
+                logger.error(
+                    f"CDN upload attempt {attempt + 1} failed: "
+                    f"{type(e).__name__}: {str(e)[:300]}"
+                )
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+
+        return {"ok": False, "error": f"CDN upload failed: {last_error}"}
 
 
 # ---------- MAX Bot Class (matching TelegramBot interface) ----------
@@ -563,7 +602,9 @@ class MAXBot:
     ):
         self._token = token or os.environ.get("MAX_BOT_TOKEN", "")
         self._reasoning_chat_id = reasoning_chat_id or int(
-            os.environ.get("REASONING_CHAT_ID", "0") or "0"
+            os.environ.get("MAX_REASONING_CHAT_ID")
+            or os.environ.get("REASONING_CHAT_ID", "0")
+            or "0"
         )
         self._api = MAXBotApi(self._token)
         self._marker: Optional[int] = None
@@ -694,6 +735,7 @@ class MAXBot:
         file_token: str,
         destination: str,
         url: Optional[str] = None,
+        max_bytes: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Download a file from MAX using its token or a CDN URL.
@@ -703,49 +745,93 @@ class MAXBot:
             destination: Absolute path or directory to save the file.
             url: Optional CDN URL (e.g., from attachment payload). If provided,
                  download directly without API authentication.
+            max_bytes: Optional maximum accepted file size. Oversized files are
+                 rejected before anything is written to disk.
 
         Returns:
             dict with ok, path, file_size, file_name.
         """
         if url:
-            # Direct CDN download – no auth needed
+            # Direct CDN download – no auth needed.  Stream so an oversized
+            # file is rejected before it is fully buffered.
+            content = b""
+            content_type = ""
+            content_disposition = ""
             try:
-                async with httpx.AsyncClient(verify=False, timeout=70.0) as client:
-                    response = await client.get(url, follow_redirects=True)
-                    response.raise_for_status()
+                async with httpx.AsyncClient(verify=True, timeout=70.0) as client:
+                    async with client.stream(
+                        "GET", url, follow_redirects=True
+                    ) as response:
+                        response.raise_for_status()
+                        content_type = response.headers.get("content-type", "")
+                        content_disposition = response.headers.get(
+                            "content-disposition", ""
+                        )
+                        length = response.headers.get("content-length", "")
+                        if (
+                            max_bytes
+                            and length.isdigit()
+                            and int(length) > max_bytes
+                        ):
+                            return {
+                                "ok": False,
+                                "error": (
+                                    f"file too large: {length} bytes "
+                                    f"(limit {max_bytes})"
+                                ),
+                                "too_large": True,
+                            }
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if max_bytes and total > max_bytes:
+                                return {
+                                    "ok": False,
+                                    "error": (
+                                        "file too large: more than "
+                                        f"{max_bytes} bytes"
+                                    ),
+                                    "too_large": True,
+                                }
+                            chunks.append(chunk)
+                        content = b"".join(chunks)
             except Exception as e:
                 logger.error(f"CDN download error: {e}")
                 return {"ok": False, "error": f"CDN download failed: {e}"}
 
-                # Determine destination path
             dest = Path(destination).resolve()
             if dest.is_dir():
                 # Try to get filename from Content-Disposition header
-                content_disposition = response.headers.get("content-disposition")
                 if content_disposition and "filename=" in content_disposition:
-                    match = re.search(r'filename["\s]*=[\s]*"?([^"]+)"?', content_disposition)
+                    match = re.search(
+                        r'filename["\s]*=[\s]*"?([^"]+)"?',
+                        content_disposition,
+                    )
                     if match:
                         filename = urllib.parse.unquote(match.group(1))
                     else:
-                        content_type = response.headers.get("content-type", "")
-                        filename = _safe_filename_from_token(file_token, content_type)
+                        filename = _safe_filename_from_token(
+                            file_token, content_type
+                        )
                 else:
-                    content_type = response.headers.get("content-type", "")
-                    filename = _safe_filename_from_token(file_token, content_type)
+                    filename = _safe_filename_from_token(
+                        file_token, content_type
+                    )
                 dest = dest / filename
 
             dest.parent.mkdir(parents=True, exist_ok=True)
 
             # Write content to disk
             try:
-                await asyncio.to_thread(dest.write_bytes, response.content)
+                await asyncio.to_thread(dest.write_bytes, content)
             except Exception as e:
                 return {"ok": False, "error": f"File write error: {e}"}
 
             return {
                 "ok": True,
                 "path": str(dest),
-                "file_size": len(response.content),
+                "file_size": len(content),
                 "file_name": dest.name,
             }
 
@@ -755,6 +841,15 @@ class MAXBot:
         try:
             response = await client.get(f"/files/{file_token}", follow_redirects=True)
             response.raise_for_status()
+            if max_bytes and len(response.content) > max_bytes:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"file too large: {len(response.content)} bytes "
+                        f"(limit {max_bytes})"
+                    ),
+                    "too_large": True,
+                }
 
             dest = Path(destination).resolve()
             if dest.is_dir():
@@ -786,12 +881,14 @@ class MAXBot:
             return {"ok": False, "error": str(e)}
 
 
-    async def _poll_updates(self) -> Dict[str, Any]:
+    async def _poll_updates(self, types: str | None = None) -> Dict[str, Any]:
         """Fetch new updates via long polling."""
-        # MAX long polling uses marker-based approach
-        params: Dict[str, Any] = {}
+        # MAX long polling uses a marker-based approach.
+        params: Dict[str, Any] = {"timeout": LONG_POLL_TIMEOUT, "limit": 100}
         if self._marker is not None:
             params["marker"] = self._marker
+        if types:
+            params["types"] = types
 
         # We need to use raw API for polling
         client = await self._api._get_client()
@@ -803,10 +900,14 @@ class MAXBot:
             )
             response.raise_for_status()
             data = response.json()
+            # The API returns {"updates": [...], "marker": N} (no "ok" field).
+            if "updates" in data:
+                self._marker = data.get("marker")
+                return {"ok": True, "result": data.get("updates", [])}
             if data.get("ok"):
                 self._marker = data.get("marker")
                 return {"ok": True, "result": data.get("updates", [])}
-            return {"ok": False, "error": data.get("error", "Unknown error")}
+            return {"ok": False, "error": data.get("error") or data.get("message") or "Unknown error"}
         except httpx.TimeoutException:
             # Timeout is normal when no updates arrive
             return {"ok": True, "result": []}

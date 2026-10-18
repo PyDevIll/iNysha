@@ -1,0 +1,17 @@
+[Unit]
+Description=iNysha Cloud Agent
+After=network.target
+
+[Service]
+Type=simple
+User=desktopme
+WorkingDirectory=/home/desktopme/iNysha
+Environment="PATH=/home/desktopme/iNysha/.venv/bin"
+ExecStart=/home/desktopme/iNysha/.venv/bin/uvicorn server.main:app --host 0.0.0.0 --port 8010 --ws-max-size 67108864
+Restart=always
+RestartSec=5
+# One core / ~3.8 GB shared with max-voice-assistant: keep memory bounded.
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

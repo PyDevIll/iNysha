@@ -122,16 +122,15 @@ async def exec_python(parameter: str, timeout: int = 90) -> str:
 
 
 async def exec_shell(command: str, timeout: int = 90) -> str:
-    """Execute arbitrary shell command on Windows 10 using cmd.exe /c.
+    """Execute an arbitrary shell command on the Linux host (via /bin/sh).
 
-    - Forces UTF-8 output via `chcp 65001`.
-    - Returns JSON: stdout, stderr, returncode.
+    - UTF-8 output; returns JSON: stdout, stderr, returncode.
     - Timeout kills the process.
     - ⚠️ WARNING: Full system access. Use ONLY on explicit user request.
 
     Args:
-        command: Shell command string (e.g., "dir /b", "ipconfig", "echo hello")
-        timeout: Execution timeout in seconds (default: 90, было 30)
+        command: Shell command string (e.g., "ls -la", "df -h", "echo hello")
+        timeout: Execution timeout in seconds (default: 90)
 
     Returns:
         JSON string with stdout, stderr, returncode
@@ -140,20 +139,22 @@ async def exec_shell(command: str, timeout: int = 90) -> str:
     if len(command) > 8190:
         return json.dumps({
             "stdout": "",
-            "stderr": "Command exceeds cmd.exe limit of 8191 characters",
+            "stderr": "Command exceeds 8191 characters",
             "returncode": -1,
         }, ensure_ascii=False)
 
-    # 2. Force UTF-8 output
-    cmd = f"chcp 65001 >nul & {command}"
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
 
     proc = None
     try:
         proc = await asyncio.create_subprocess_shell(
-            cmd,
+            command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.getcwd(),
+            env=env,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
@@ -198,12 +199,12 @@ def _decode_output(data: bytes) -> str:
             return data.decode('latin-1', errors='replace')
 
 
-async def schedule_task(prompt: str, delay_minutes: int = 10) -> str:
+async def schedule_task(prompt: str, delay_minutes: int = 10, chat_id: str = "") -> str:
     """Schedule an LLM self-call. On the next user message after delay expires,
     the prompt is injected as if the user asked it. No external scheduler needed."""
-    from scheduler import get_scheduler
+    from lib.scheduler import get_scheduler
     sched = get_scheduler()
-    task = sched.add_task(prompt, delay_minutes, chat_id)
+    task = sched.add_task(prompt, delay_minutes, chat_id or None)
     return json.dumps({
         "ok": True,
         "task_id": task["id"],
@@ -215,18 +216,18 @@ async def schedule_task(prompt: str, delay_minutes: int = 10) -> str:
 
 async def list_scheduled_tasks() -> str:
     """List all pending scheduled tasks, optionally filtered by chat_id."""
-    from scheduler import get_scheduler
+    from lib.scheduler import get_scheduler
     sched = get_scheduler()
     tasks = sched.list_tasks()
     if not tasks:
         return json.dumps({"ok": True, "tasks": [], "message": "No pending tasks"}, ensure_ascii=False)
-    result = [{"id": t["id"], "prompt": t["prompt"][:120], "run_at": t["run_at_str"], "chat_id": t["chat_id"]} for t in tasks]
+    result = [{"id": t["id"], "prompt": t["prompt"][:120], "run_at": t["run_at_str"], "chat_id": t.get("chat_id")} for t in tasks]
     return json.dumps({"ok": True, "tasks_count": len(result), "tasks": result}, ensure_ascii=False)
 
 
 async def cancel_scheduled_task(task_id: str) -> str:
     """Cancel a pending scheduled task by its ID."""
-    from scheduler import get_scheduler
+    from lib.scheduler import get_scheduler
     sched = get_scheduler()
     ok = sched.cancel_task(task_id)
     if ok:
@@ -251,8 +252,8 @@ TOOL_DEFINITIONS = [
         },
         "required": ["parameter"],
     }),
-    ("exec_shell", exec_shell, "⚠️ WARNING: Full system access. Use ONLY on explicit user request. Execute arbitrary shell command on Windows 10 (cmd.exe /c). "
-     "⚠️ Full shell access. Supports pipes, redirects, batch commands.", {
+    ("exec_shell", exec_shell, "⚠️ WARNING: Full system access. Use ONLY on explicit user request. Execute arbitrary shell command on Linux (sh -c). "
+     "⚠️ Full shell access. Supports pipes, redirects, shell commands.", {
         "type": "object",
         "properties": {
             "command": {
@@ -272,6 +273,7 @@ TOOL_DEFINITIONS = [
         "properties": {
             "prompt": {"type": "string", "description": "The prompt/question to ask the LLM when the time comes"},
             "delay_minutes": {"type": "integer", "description": "Delay in minutes before execution (default: 10)"},
+            "chat_id": {"type": "string", "description": "Optional MAX chat_id the result should be reported to"},
         },
         "required": ["prompt"],
     }),

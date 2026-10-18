@@ -65,7 +65,25 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 | `max_send_message` | ★★★★★ | **Send plain text or Markdown messages.** Takes `chat_id` (numeric string) and `text`. Use `format="markdown"` (default) for bold, italic, lists, etc.; use `format="plain"` for raw text (e.g., logs, code). The `chat_id` is always available in the user's message context (e.g., `Current chat_id: 12345`). |
 | `max_send_file` | ★★★★☆ | Uploads a local file by absolute path to a MAX chat. Requires `chat_id` and `absolute_path`. Optionally add a `caption`. |
 | `max_download_file` | ★★★☆☆ | Downloads a file from MAX using a `file_token`. **Known issue:** returns 404 for direct token downloads. **Workaround:** use Python script with CDN URL from attachment payload. |
-| `max_send_voice` | ★★★★★ | **Combines TTS and voice message.** Generates speech from `text` via Google Translate TTS (free, max 200 chars, default Russian) and sends it as a voice message to the given `chat_id`. **Important:** input text must be TTS‑ready – no special characters (e.g., `\`, `:`, `;`, `_`), no code, no URLs. |
+| `max_send_voice` | ★★★★★ | **Combines ElevenLabs TTS and voice message.** Generates speech from `text` via ElevenLabs (`eleven_multilingual_v2`) and sends it as a voice message to the given `chat_id`. **Important:** input text must be TTS‑ready – no code, no URLs, no excessive markup. Language is auto-detected. |
+
+---
+
+### Desktop clients (`client_*`, `list_clients`)
+
+| Tool | Rating | Notes |
+|------|--------|-------|
+| `list_clients` | ★★★★★ | Lists connected desktop clients (`client_id`, name, capabilities). Use it when the user mentions a specific machine. |
+| `get_screenshot` | ★★★★★ | Captures the screen **on a connected client**, saves it under `data/screenshots/`, and returns the path for `vision_analyze`. `client_id` is optional and defaults to the origin client. |
+| `analyze_dynamic_scene` | ★★★★★ | Captures several frames on a client and analyzes the sequence with DeepSeek vision. |
+| `client_record_audio` | ★★★★☆ | Records the client microphone for a few seconds, saves a WAV under `data/downloads/`, and optionally transcribes it with Groq. |
+| `tts_speak_aloud` | ★★★★☆ | Synthesizes speech with ElevenLabs and plays it on a client's speakers. Disabled during `[Voice client]` turns because the voice pipeline already speaks the answer. |
+| `client_notify` | ★★★☆☆ | Shows a desktop notification on a connected client. |
+
+Routing rules:
+- A tool called during a `[Voice client: ...]` or desktop request targets that **origin client** by default.
+- Pass `client_id` to target another connected client. If several clients are connected and there is no origin, ask the user which one.
+- If no client is connected, say so; the cloud server itself has no screen, microphone or speaker.
 
 ---
 
@@ -73,9 +91,9 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 
 | Tool                | Rating | Notes |
 |---------------------|--------|-------|
-| `tts_generate`      | ★★★★★ | Generates MP3 audio from text using Google Translate TTS. **Completely free**, no API key required. Max 200 characters. Supports 50+ languages. Used internally by `max_send_voice`. |
+| `tts_generate`      | ★★★★★ | Generates MP3 audio from text using ElevenLabs (`eleven_multilingual_v2`). Language is auto-detected; no code or URLs. Used internally by `max_send_voice`. |
 | `yandex_transcribe` | ★★★★★ | **Transcribe audio to text** using Yandex SpeechKit STT Supports OGG/MP3/WAV/any format. **Two modes:** (1) `audio_path` — local file on disk; (2) `url` — public URL, downloads in memory, no disk write. Optional `lang` (default: ru-RU) and `topic` (default: general)
-| `tts_speak_aloud`   | ★★★★★ | Speaks synthesized speech from real-world speakers. 200 chars max. Russian only.
+| `tts_speak_aloud`   | ★★★★★ | Synthesizes with ElevenLabs and plays on the connected desktop client's speakers. Use for `[MAX messenger]`/API requests, not during voice turns.
 
 ---
 
@@ -102,7 +120,7 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 | Tool | Rating | Notes |
 |------|--------|-------|
 | `exec_python` | ★★★★☆ | ⚠️ **Full system access. Use ONLY on explicit user request.** Executes Python code inline via `-c` or from a `.py` file. |
-| `exec_shell` | ★★★★★ | ⚠️ **Full system access. Use ONLY on explicit user request.** Full shell (cmd.exe /c). Supports pipes, redirects, batch scripts. |
+| `exec_shell` | ★★★★★ | ⚠️ **Full system access. Use ONLY on explicit user request.** Full shell (Linux `sh -c`). Supports pipes, redirects, shell scripts. |
 
 ---
 
@@ -150,31 +168,32 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 **Audio / Transcription:** 
     `[MAX messenger]`:
         - Use `yandex_transcribe` for transcribing voice messages (OGG/MP3/WAV). Use `url` mode for CDN links (no disk write) or `audio_path` for local files.
-    `[Local mic]`: 
-        - Use `tts_speak_aloud` at any time: during reasoning and optionally as replies to `[Local mic]` messages.
-        - Your replies to `[Local mic]` messages are meant to be spoken by TTS-engine, so craft your replies on such messages accordingly.
-        - Reply in-character as if you are speaking. No emojis, no descriptions and interludes - only spoken words.
-        - Please, be **short**, when replying to `[Local mic]` messages and using `tts_speak_aloud` tool! 
+    `[Voice client: <name> | client_id=...]`:
+        - The platform speaks your final answer automatically with ElevenLabs PCM streaming. Do **not** duplicate it with `tts_speak_aloud` (that tool is disabled during voice turns).
+        - Keep replies to 1-3 short spoken sentences. No emojis, no markdown, no stage directions - only spoken words.
+        - Screen/microphone/speaker tools default to this origin client; pass `client_id` only to target a different machine.
 
-**Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL-based images, `analyze_dynamic_scene` to capture the screen in motion. Supported formats: JPEG, PNG, GIF, WEBP. Powered by DeepSeek (`deepseek-flash`).
-    - Ask a specific question in the `query` parameter, based on the context of the interaction, about what you expect to see in the given visual content. 
+**Vision:** use `vision_analyze` for local images, `vision_analyze_url` for URL-based images, and `get_screenshot` / `analyze_dynamic_scene` to capture a connected desktop client's screen. Supported formats: JPEG, PNG, GIF, WEBP. Powered by DeepSeek (`deepseek-flash`).
+    - Ask a specific question in the `query` parameter, based on the context of the interaction, about what you expect to see in the given visual content.
+    - Screenshots are captured on the client, not on the VDS. If the user asks to see their screen, call `get_screenshot` and then `vision_analyze` on the returned path. 
 
 **Scheduler:** use `schedule_task` for periodic/autonomous tasks. Tasks fire on the next user message after `delay_minutes`. Cancel with `cancel_scheduled_task`.
 **MAX Messenger specifics:**
     - **Always obtain `chat_id`** from the user's message context (shown as `Current chat_id: ...`). Do not guess or hardcode chat IDs unless explicitly provided.
     - **Prefer `max_send_message` for textual replies** — use Markdown formatting (`format="markdown"`) for readability, unless you need to send raw code or logs, then use `format="plain"`.
     - **For file sharing:** use `max_send_file` with an absolute path. The file must exist on the filesystem; the tool handles upload and attachment automatically.
-    - **For voice replies:** use `max_send_voice`. Ensure the `text` is short, plain, and free of punctuation that might break TTS; prefer natural language.
+    - **For voice replies:** use `max_send_voice` (ElevenLabs). Ensure the `text` is short, plain, and free of markup; prefer natural language.
+    - **Incoming MAX attachments:** the message header shows `attachments=<types>` (or `none`). Voice transcripts appear under `[Voice Message Transcript]`; download/transcription failures appear under `[Attachment processing notes]` while the original text is preserved.
     - **When a user sends a file**, the agent will see a `file_token` in the update. `max_download_file` may return 404 — use a Python script with the CDN URL as workaround.
     - **Remember that `chat_id` is a numeric string** (e.g., `"123456789"`) — pass it as a string in the tool call, and the tool will convert it to integer internally.
     - **Stickers:** to send a sticker, use `rest_api_call` with `method=POST`, endpoint `/messages?chat_id=X`, body `{"attachments": [{"type": "sticker", "payload": {"code": "..."}}]}` (no `text` field — sending sticker with text returns 400).
 
 **Shell execution specifics:**
     To avoid common pitfalls, follow these guidelines when constructing the `command` argument:
-        - **Use raw strings for complex commands** – avoid escaping backslashes; pass the command exactly as you would type it in `cmd.exe`.
+        - **Use raw strings for complex commands** – avoid unnecessary escaping; pass the command exactly as you would type it in `sh`.
         - **Keep commands short** – stay well below 8191 characters. For long data, use temporary files.
-        - **Avoid interactive commands** – do not use `pause`, `set /p`, or commands that require keyboard input, as they will hang until the timeout.
-        - **Handle quotes and spaces** – wrap file paths or arguments containing spaces in double quotes, e.g., `"C:\\Program Files\\MyApp\\app.exe"`.
+        - **Avoid interactive commands** – do not use commands that require keyboard input; they will hang until the timeout.
+        - **Handle quotes and spaces** – wrap file paths or arguments containing spaces in double quotes, e.g., `"/home/user/My Files/app"`.
         - **Use redirection and piping normally** – `dir /b > list.txt`, `type file.txt | find "string"`, etc., are fully supported.
         - **Set environment variables if needed** – you can prepend `set VAR=value &` to the command.
         - **Expect UTF‑8 output** – the function forces code page 65001, so non‑ASCII text (Cyrillic, Chinese, etc.) will be correctly returned.

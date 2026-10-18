@@ -2,8 +2,6 @@ import requests
 
 import httpx
 import io
-import pydub
-from pydub.playback import play
 import os
 import asyncio
 from time import time
@@ -73,6 +71,10 @@ async def _tts_synthesizer(
 def play_pydub(chunk, rate):
     if chunk:
         print("Playing...")
+        # Imported lazily: the cloud server has no audio device.
+        import pydub
+        from pydub.playback import play
+
         segment = pydub.AudioSegment.from_raw(
             io.BytesIO(chunk),
             sample_width=2,  # 16-bit = 2 bytes
@@ -108,19 +110,35 @@ async def tts_speak(text):
 # |-- Listening ---|
 # |----------------|
 
-import webrtcvad
 import collections
-import pyaudio
 
 # Настройки потокового распознавания.
-FORMAT = pyaudio.paInt16
 CHANNELS = 1
 FRAME_MS = 30
 FRAME_SIZE = int(STT_RATE * FRAME_MS / 1000)
 FRAME_BYTES = FRAME_SIZE * 2
 MINIMAL_VOICE_FRAMES = 10
 
-audio = pyaudio.PyAudio()
+# PyAudio is imported lazily: the cloud server has no audio hardware.
+_audio = None
+
+
+def _get_audio():
+    global _audio
+    if _audio is None:
+        import pyaudio
+        _audio = pyaudio.PyAudio()
+    return _audio
+
+
+def _cleanup_audio():
+    global _audio
+    if _audio is not None:
+        try:
+            _audio.terminate()
+        except Exception:
+            pass
+        _audio = None
 
 def _transcribe_yandex_bytes(
     audio_bytes: bytes,
@@ -168,6 +186,8 @@ def _transcribe_yandex_bytes(
 
 
 async def stt_listen_and_collect(speech_callback):
+    import webrtcvad
+
     vad = webrtcvad.Vad(3)
     last_frames = collections.deque(maxlen=10)
     voice_frames = []
@@ -244,9 +264,11 @@ async def stt_listen_and_collect(speech_callback):
 
 def stt_start_audio_stream():
     global stt_audio_stream
+    import pyaudio
+
     print("Chunk size:", FRAME_BYTES)
-    stt_audio_stream = audio.open(
-        format=FORMAT,
+    stt_audio_stream = _get_audio().open(
+        format=pyaudio.paInt16,
         channels=CHANNELS,
         rate=STT_RATE,
         input=True,
@@ -295,4 +317,4 @@ def stt_stop():
         stt_listen_task.cancel()
 
 
-atexit.register(audio.terminate)
+atexit.register(_cleanup_audio)

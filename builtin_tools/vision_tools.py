@@ -6,8 +6,6 @@ import os
 from datetime import datetime
 import asyncio
 
-import mss
-import mss.tools
 import io
 from PIL import Image
 
@@ -28,10 +26,15 @@ def _get_env_or_raise(key: str) -> str:
 
 def _deepseek_client() -> AsyncOpenAI:
     """Build an OpenAI-compatible client for the DeepSeek vision endpoint."""
-    return AsyncOpenAI(
-        api_key=_get_env_or_raise("DEEPSEEK_API_KEY"),
-        base_url=_get_env_or_raise("DEEPSEEK_API_ENDPOINT"),
-    )
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    base_url = os.getenv("DEEPSEEK_BASE_URL") or os.getenv("DEEPSEEK_API_ENDPOINT")
+    if not api_key:
+        raise ValueError("Environment variable DEEPSEEK_API_KEY is not set")
+    if not base_url:
+        raise ValueError(
+            "Neither DEEPSEEK_BASE_URL nor DEEPSEEK_API_ENDPOINT is set"
+        )
+    return AsyncOpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
 
 
 # Add the multi-image API caller
@@ -111,6 +114,8 @@ async def vision_analyze_url(image_url: str, query: str = "Опиши, что и
 def get_mss():
     global _mss_instance
     if not _mss_instance:
+        # Imported lazily: the cloud server has no display.
+        import mss
         _mss_instance = mss.mss()
     return _mss_instance
 

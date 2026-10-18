@@ -1,2 +1,9 @@
 .env
-.aider*
+.venv/
+.venv-client/
+DEV_AGREED_DESIGN.md
+YANDEX_CLOUD_SERVERLESS_FUNC_REFERENCE.md
+
+__pycache__/
+*.pyc
+data/

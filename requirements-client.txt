@@ -1,0 +1,12 @@
+# iNysha desktop client dependencies.
+# Runs on the machine that has the screen, microphone and speakers.
+
+websockets>=14.1
+httpx>=0.28.1
+python-dotenv>=1.0.1
+loguru>=0.7.3
+sounddevice>=0.5.0
+numpy
+mss>=10.2.0
+pillow
+pynput>=1.7.7

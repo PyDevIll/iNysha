@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 from loguru import logger
+from lib.elevenlabs_tts import synthesize_to_file
 from lib.tts_rest_services import _tts_synthesizer
 
 DEFAULT_TTS_DIR = Path(__file__).resolve().parent.parent / "data" / "tts_cache"
@@ -269,19 +270,18 @@ async def tts_generate(
     speed: float = 1.2,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Generate speech audio from text.
+    """Generate speech audio with ElevenLabs.
 
     Args:
-        text: Text to speak (max 200 chars, Russian by default)
-        lang: Language code: ru (Russian), en (English), ja (Japanese), etc.
-        speed: Speech speed (1.0 = normal, 1.5 = fast)
+        text: Text to speak (plain speech, no code/URLs).
+        lang: Language hint (unused; ElevenLabs auto-detects).
+        speed: Speech speed hint (unused; kept for backward compatibility).
         output_dir: Optional output directory (default: data/tts_cache)
 
     Returns:
         dict: {\"ok\": True, \"path\": \"...\", \"file_size\": 1234} on success
     """
-    # return await _tts_google(text=text, lang=lang, speed=speed, output_dir=output_dir)
-    return await _tts_yandex(text=text, lang=lang, speed=speed, output_dir=output_dir)
+    return await synthesize_to_file(text, output_dir=output_dir)
 
 
 async def tts_speak_aloud(text: str):
@@ -313,22 +313,22 @@ def register_all(registry) -> None:
     registry.register_function(
         func=tts_generate,
         name="tts_generate",
-        description="Generate speech audio (MP3) from text using Google Translate TTS. FREE, no API key needed. Max 200 chars. Supports ru, en, ja, and 50+ languages.",
+        description="Generate speech audio (MP3) from text using ElevenLabs (eleven_multilingual_v2). Plain speech only; no code or URLs. Language is auto-detected.",
         parameters={
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Text to speak (max 200 chars, Russian by default)",
+                    "description": "Text to speak (plain speech, no code or URLs)",
                 },
                 "lang": {
                     "type": "string",
-                    "description": "Language code: ru, en, ja, etc. (default: ru)",
+                    "description": "Language hint (unused; auto-detected)",
                 },
                 "speed": {
                     "type": "number",
-                    "description": "Скорость речи (1.0 = нормальная, 1.5 = быстрая)",
-                    "default": 1.5,
+                    "description": "Speech speed hint (unused; kept for compatibility)",
+                    "default": 1.2,
                 },
                 "output_dir": {
                     "type": "string",

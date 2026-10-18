@@ -41,7 +41,7 @@ async def run_http_server():
 
 
 # Initialize MAX bot
-bot = MAXBot(token=os.environ.get("MAX_BOT_TOKEN"), reasoning_chat_id=326963375)
+bot = MAXBot(token=os.environ.get("MAX_BOT_TOKEN"))
 
 registry = get_registry()
 registry.set_bot(bot)

@@ -1,14 +1,21 @@
-uvicorn~=0.51.0
-loguru~=0.7.3
+# iNysha cloud server dependencies.
+# Audio capture/playback and screen capture live on the desktop client
+# (see requirements-client.txt) — the server only needs network/LLM libs.
+
 fastapi~=0.139.2
+uvicorn[standard]~=0.51.0
 httpx~=0.28.1
-toons~=0.7.0
-mss~=10.2.0
-tiktoken~=0.13.0
+loguru~=0.7.3
 python-dotenv~=1.2.2
 openai~=2.46.0
 requests~=2.34.2
-pydub~=0.25.1
+tiktoken~=0.13.0
+tavily-python
+toons~=0.7.0
 webrtcvad-wheels~=2.0.14
-PyAudio~=0.2.14
 pillow
+truststore
+
+# Voice pipeline (same versions as the working max-voice-assistant backend)
+groq==0.13.0
+elevenlabs==2.69.0

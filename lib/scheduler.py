@@ -12,7 +12,7 @@ from typing import Optional
 
 from loguru import logger
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TASKS_FILE = DATA_DIR / "scheduler_tasks.json"
 
 # Unique ID counter (thread-safe)
@@ -71,11 +71,17 @@ class Scheduler:
 
     # ── public API ───────────────────────────────────────────────
 
-    def add_task(self, prompt: str, delay_minutes: int) -> dict:
+    def add_task(
+        self,
+        prompt: str,
+        delay_minutes: int,
+        chat_id: str | None = None,
+    ) -> dict:
         """Schedule a task. Returns the task dict."""
         task = {
             "id": _generate_id(),
             "prompt": prompt,
+            "chat_id": chat_id,
             "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
             "run_at": int(time.time()) + delay_minutes * 60,
             "run_at_str": datetime.fromtimestamp(

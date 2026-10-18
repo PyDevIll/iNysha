@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import json
 
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Optional
 
 from loguru import logger
 
-# Reuse TTS generation from tts_tools
-from .tts_tools import tts_generate
+from lib.elevenlabs_tts import synthesize_to_file
 
 
 # ----------------------------------------------------------------------
@@ -102,43 +102,60 @@ async def max_send_voice(
     lang: str = "ru",
     caption: str = "",
 ) -> dict[str, Any]:
-    """Generate TTS audio and send as voice message to MAX chat.
+    """Generate TTS audio with ElevenLabs and send it as a MAX voice message.
 
-    ⚠️ TTS‑READINESS: 'text' must be plain speech, no special symbols,
-    no code, no URLs. Max 200 chars.
-
-    Combines Google Translate TTS + MAX voice attachment.
+    ⚠️ TTS‑READINESS: 'text' should be plain speech — no code, no URLs, no
+    excessive markup.  ElevenLabs auto-detects the language; ``lang`` is kept
+    for backward compatibility and is not sent to the API.
 
     Args:
-        text: Text to speak (max 200 chars). MUST be TTS‑ready plain speech.
+        text: Text to speak.
         chat_id: MAX chat ID (numeric string)
-        lang: Language code: ru, en, ja, etc. (default: ru)
+        lang: Language hint (unused; ElevenLabs auto-detects)
         caption: Optional caption for the voice message
 
     Returns:
         dict: {"ok": True, "result": {...}} on success
     """
-    # Step 1: Generate TTS audio
-    tts_result = await tts_generate(text=text, lang=lang)
+    text = (text or "").strip()
+    if not text:
+        return {"ok": False, "error": "text is required"}
+
+    # Step 1: Generate TTS audio with ElevenLabs.
+    tts_result = await synthesize_to_file(text)
     if not tts_result.get("ok"):
         return tts_result
 
-    audio_path = tts_result["path"]
+    audio_path = Path(tts_result["path"])
 
     # Step 2: Get bot instance
     bot = _get_bot_from_registry()
     if bot is None:
+        with suppress(OSError):
+            audio_path.unlink(missing_ok=True)
         return {"ok": False, "error": "MAX bot not available"}
 
-    # Step 3: Send as voice
-    send_result = await bot.send_voice(
-        chat_id=int(chat_id),
-        voice_path=audio_path,
-        caption=caption if caption else None,
-    )
+    # Step 3: Send as voice.  The generated file is temporary; remove it after
+    # the upload/send completes.
+    try:
+        send_result = await bot.send_voice(
+            chat_id=int(chat_id),
+            voice_path=str(audio_path),
+            caption=caption if caption else None,
+        )
+    except Exception as exc:
+        logger.exception("MAX voice send failed")
+        return {"ok": False, "error": str(exc)}
+    finally:
+        with suppress(OSError):
+            audio_path.unlink(missing_ok=True)
 
     if send_result.get("ok"):
-        logger.info(f"Voice sent to chat {chat_id}: '{text[:50]}...'")
+        logger.info(
+            f"Voice sent to chat {chat_id} via ElevenLabs "
+            f"({tts_result.get('voice_id')}): {text[:50]!r}..."
+        )
+        _mark_chat_replied(chat_id)
 
     return send_result
 
@@ -182,6 +199,7 @@ async def max_send_message(
     logger.info(f"MAX tool: sending message to chat_id={chat_id}: {text[:50]}...")
     result = await bot._api.send_message_to_chat(int(chat_id), text, extra)
     if result:
+        _mark_chat_replied(chat_id)
         return {"ok": True, "result": result}
     else:
         return {"ok": False, "error": "send failed"}
@@ -255,6 +273,17 @@ def _get_bot_from_registry():
     return bot
 
 
+def _mark_chat_replied(chat_id) -> None:
+    """Record that this turn already answered a chat (avoids a duplicate final reply)."""
+    try:
+        from server.context import get_request_context
+    except Exception:
+        return
+    ctx = get_request_context()
+    if ctx is not None:
+        ctx.sent_chats.add(str(chat_id))
+
+
 # ----------------------------------------------------------------------
 # Tool definitions
 # ----------------------------------------------------------------------
@@ -292,14 +321,15 @@ TOOL_DEFINITIONS: list[tuple] = [
     (
         "max_send_voice",
         max_send_voice,
-        "Generate TTS and send as voice message to MAX chat. ⚠️ text MUST be TTS‑ready: "
-        "no special chars, no code, no URLs. Combines Google TTS + MAX voice.",
+        "Generate TTS with ElevenLabs and send it as a voice message to a MAX chat. "
+        "⚠️ text MUST be TTS‑ready: no code, no URLs, no excessive markup. "
+        "ElevenLabs auto-detects the language.",
         {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Text to speak (max 200 chars). Plain speech only.",
+                    "description": "Text to speak. Plain speech only.",
                 },
                 "chat_id": {
                     "type": "string",
@@ -307,7 +337,7 @@ TOOL_DEFINITIONS: list[tuple] = [
                 },
                 "lang": {
                     "type": "string",
-                    "description": "Language code: ru, en, ja, etc. (default: ru)",
+                    "description": "Language hint (unused; ElevenLabs auto-detects)",
                 },
                 "caption": {
                     "type": "string",

@@ -3,6 +3,8 @@
 Provides: reload_tools — hot-reload all builtin tool modules without restart.
 """
 
+import json
+
 from loguru import logger
 from tool_registry import get_registry
 
