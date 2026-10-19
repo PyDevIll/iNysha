@@ -18,6 +18,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import uuid
 from contextlib import suppress
 from typing import Any
 
@@ -50,6 +51,7 @@ class DesktopClient:
         self._audio_queue: asyncio.Queue[bytes] | None = None
         self._control_send_lock = asyncio.Lock()
         self._rpc_tasks: set[asyncio.Task] = set()
+        self._prompt_futures: dict[str, asyncio.Future[str]] = {}
         self._hotkey_listener = None
         self._server_client_id: str | None = None
 
@@ -149,6 +151,8 @@ class DesktopClient:
                             )
                             self._rpc_tasks.add(task)
                             task.add_done_callback(self._rpc_tasks.discard)
+                        elif message.get("type") == "prompt_result":
+                            self._resolve_prompt(message)
                         elif message.get("type") == "pong":
                             pass
                         else:
@@ -159,10 +163,29 @@ class DesktopClient:
                 logger.warning(f"control channel disconnected: {exc}")
             finally:
                 self.control_ws = None
+                self._fail_prompt_futures("control channel disconnected")
             if self._stopping.is_set():
                 break
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
+
+    def _resolve_prompt(self, message: dict[str, Any]) -> None:
+        prompt_id = str(message.get("id") or "")
+        future = self._prompt_futures.get(prompt_id)
+        if future is None or future.done():
+            logger.warning(f"late/unknown prompt result: {prompt_id}")
+            return
+        if message.get("ok"):
+            future.set_result(str(message.get("text") or ""))
+        else:
+            future.set_exception(
+                RuntimeError(str(message.get("error") or "prompt failed"))
+            )
+
+    def _fail_prompt_futures(self, reason: str) -> None:
+        for future in list(self._prompt_futures.values()):
+            if not future.done():
+                future.set_exception(ConnectionError(reason))
 
     async def _handle_rpc(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -476,12 +499,42 @@ class DesktopClient:
         )
 
     # ------------------------------------------------------------------
+    # text prompts
+    # ------------------------------------------------------------------
+    async def send_prompt(self, text: str) -> None:
+        """Send typed text to the shared agent and print its answer."""
+        text = text.strip()
+        if len(text) <= 1:
+            return
+        if self.control_ws is None:
+            print("Сервер ещё не подключён — текст не отправлен.")
+            return
+
+        prompt_id = uuid.uuid4().hex
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._prompt_futures[prompt_id] = future
+        try:
+            await self._send_control(
+                {"type": "prompt", "id": prompt_id, "text": text}
+            )
+            print("… отправлено агенту", flush=True)
+            answer = await asyncio.wait_for(future, timeout=300.0)
+            print(f"\niNysha: {answer}\n", flush=True)
+        except asyncio.TimeoutError:
+            print("\nАгент не ответил за 5 минут.")
+        except Exception as exc:
+            print(f"\nОшибка запроса: {exc}")
+        finally:
+            self._prompt_futures.pop(prompt_id, None)
+
+    # ------------------------------------------------------------------
     # console
     # ------------------------------------------------------------------
     async def _console_loop(self) -> None:
         await asyncio.sleep(0.5)
         print(
-            "\nКоманды: v — голос, s — скриншот, d — аудиоустройства, q — выход\n"
+            "\nКоманды: v — голос, s — скриншот, d — аудиоустройства, "
+            "q — выход.\nЛюбой другой текст отправляется агенту.\n"
         )
         while not self._stopping.is_set():
             try:
@@ -489,7 +542,10 @@ class DesktopClient:
             except (EOFError, OSError):
                 await asyncio.sleep(1.0)
                 continue
-            command = (line or "").strip().lower()
+            raw = (line or "").strip()
+            if not raw:
+                continue
+            command = raw.lower()
             if command in {"q", "quit", "exit"}:
                 self._stopping.set()
                 return
@@ -512,7 +568,9 @@ class DesktopClient:
                     print(list_devices())
                 except Exception as exc:
                     print(f"Ошибка аудио: {exc}")
-            elif command:
+            elif len(raw) > 1:
+                await self.send_prompt(raw)
+            else:
                 print("Неизвестная команда. v / s / d / q")
 
 

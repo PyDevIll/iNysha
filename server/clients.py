@@ -5,8 +5,17 @@ server can call methods on it (screenshot, record audio, play PCM, ...) with a
 simple request/response RPC.  Voice traffic uses a separate ``/ws/voice``
 socket, so a long recording or a screenshot never blocks audio.
 
-Only the server can initiate RPC calls.  Results are correlated by an opaque
+Only the server initiates RPC calls.  Results are correlated by an opaque
 request id and every pending call fails as soon as the client disconnects.
+
+The same socket also carries typed console prompts:
+
+    client -> server: {"type": "prompt", "id": "...", "text": "..."}
+    server -> client: {"type": "prompt_result", "id": "...", "ok": true,
+                       "text": "..."}
+
+Typed prompts enter the same serialized agent queue as MAX, API and voice
+traffic, and inherit the originating ``client_id`` for remote tools.
 """
 
 from __future__ import annotations
@@ -248,6 +257,67 @@ async def client_ws(websocket: WebSocket) -> None:
         }
     )
 
+    prompt_tasks: set[asyncio.Task] = set()
+
+    async def run_text_prompt(prompt_id: str, text: str) -> None:
+        """Enqueue a console prompt and return the agent's answer."""
+        from server.queue import Request
+        from server.routing import FutureReply
+        from server.runtime import runtime
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        header = (
+            f"[Desktop client: {info.name} | client_id={info.client_id} | "
+            f"trusted={'true' if config.CLIENT_TRUSTED else 'false'}]"
+        )
+        request = Request(
+            text=f"{header}\n{text}",
+            source="client_text",
+            client_id=info.client_id,
+            trusted=config.CLIENT_TRUSTED,
+            reply=FutureReply(future),
+        )
+        try:
+            await runtime.queue.put(request)
+            logger.info(
+                f"[{request.id}] queued text prompt from client "
+                f"{info.client_id} (queue left={runtime.queue.qsize()})"
+            )
+            answer = await asyncio.wait_for(
+                future, timeout=config.VOICE_TURN_TIMEOUT
+            )
+            payload = {
+                "type": "prompt_result",
+                "id": prompt_id,
+                "ok": True,
+                "text": (answer or "").strip(),
+                "request_id": request.id,
+            }
+        except asyncio.TimeoutError:
+            payload = {
+                "type": "prompt_result",
+                "id": prompt_id,
+                "ok": False,
+                "error": "agent turn timed out",
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(f"text prompt failed for {info.client_id}")
+            payload = {
+                "type": "prompt_result",
+                "id": prompt_id,
+                "ok": False,
+                "error": str(exc),
+            }
+
+        try:
+            await info.send_json(payload)
+        except Exception:
+            # The client may have disconnected while the agent was working.
+            pass
+
     try:
         while True:
             message = await websocket.receive_json()
@@ -260,6 +330,27 @@ async def client_ws(websocket: WebSocket) -> None:
                     message.get("result"),
                     message.get("error"),
                 )
+            elif mtype == "prompt":
+                prompt_id = str(message.get("id") or uuid.uuid4().hex)
+                text = str(message.get("text") or "").strip()
+                if len(text) <= 1:
+                    await info.send_json(
+                        {
+                            "type": "prompt_result",
+                            "id": prompt_id,
+                            "ok": False,
+                            "error": "prompt text is too short",
+                        }
+                    )
+                else:
+                    # Run in a task: a slow agent turn must not block
+                    # screenshots or other control RPC traffic.
+                    task = asyncio.create_task(
+                        run_text_prompt(prompt_id, text[:8000]),
+                        name=f"prompt-{info.client_id}",
+                    )
+                    prompt_tasks.add(task)
+                    task.add_done_callback(prompt_tasks.discard)
             elif mtype == "ping":
                 await info.send_json({"type": "pong", "t": message.get("t")})
             elif mtype == "log":
@@ -275,4 +366,8 @@ async def client_ws(websocket: WebSocket) -> None:
     except Exception:
         logger.exception(f"client '{info.client_id}' control socket failed")
     finally:
+        for task in list(prompt_tasks):
+            task.cancel()
+        if prompt_tasks:
+            await asyncio.gather(*prompt_tasks, return_exceptions=True)
         hub.unregister(info)

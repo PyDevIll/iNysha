@@ -80,6 +80,8 @@ Console commands:
 - `s` — take a local test screenshot
 - `d` — list audio devices
 - `q` — quit
+- any other line of **2 or more characters** — sent to the server agent as a
+  normal text prompt; the answer is printed in the console
 
 The global hotkey (default `F8`) toggles the same voice session.
 
