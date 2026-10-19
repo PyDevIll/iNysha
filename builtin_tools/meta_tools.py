@@ -47,7 +47,17 @@ TOOL_DEFINITIONS = [
 ]
 
 
+# Отключены: ping бесполезен, reload_tools нужен только при правке тулов
+# (достаточно рестарта сервиса).
+DISABLED_TOOLS = {"ping", "reload_tools"}
+
+
 def register_all(registry):
+    registered = 0
     for name, func, desc, params in TOOL_DEFINITIONS:
+        if name in DISABLED_TOOLS:
+            continue
         registry.register_function(func, name, desc, params)
-    logger.info(f"Registered {len(TOOL_DEFINITIONS)} meta tool(s)")
+        registered += 1
+    logger.info(f"Registered {registered}/{len(TOOL_DEFINITIONS)} meta tool(s) "
+                f"({len(DISABLED_TOOLS)} disabled)")

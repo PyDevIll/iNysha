@@ -830,9 +830,21 @@ TOOL_DEFINITIONS = [
 
 GROUP = "fs"
 
+# Деактивированные инструменты (сознательно вырезаны из промпта, функции оставлены
+# для обратной совместимости; чтобы вернуть — удалить имя из этого множества).
+DISABLED_TOOLS = {
+    "fs_cd", "fs_pwd", "fs_touch", "fs_sizes", "fs_json_query",
+    "fs_grep", "fs_tail", "fs_find", "fs_mkdir", "fs_rm", "fs_mv", "fs_cp",
+}
+
 
 def register_all(registry):
     """Register all file system tools with the given registry."""
+    registered = 0
     for name, func, desc, params in TOOL_DEFINITIONS:
+        if name in DISABLED_TOOLS:
+            continue
         registry.register_function(func, name, desc, params, group=GROUP)
-    logger.info(f"Registered {len(TOOL_DEFINITIONS)} FS tools")
+        registered += 1
+    logger.info(f"Registered {registered}/{len(TOOL_DEFINITIONS)} FS tools "
+                f"({len(DISABLED_TOOLS)} disabled)")

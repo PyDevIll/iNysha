@@ -74,8 +74,18 @@ TOOL_DEFINITIONS = [
 ]
 
 
+# Git-инструменты отключены: git вызывается через exec_shell
+# (git --no-pager status --short / log --oneline / diff --stat).
+DISABLED_TOOLS = {"git_status", "git_log", "git_diff"}
+
+
 def register_all(registry):
     """Register all git tools with the given registry."""
+    registered = 0
     for name, func, desc, params in TOOL_DEFINITIONS:
+        if name in DISABLED_TOOLS:
+            continue
         registry.register_function(func, name, desc, params)
-    logger.info(f"Registered {len(TOOL_DEFINITIONS)} git tools")
+        registered += 1
+    logger.info(f"Registered {registered}/{len(TOOL_DEFINITIONS)} git tools "
+                f"({len(DISABLED_TOOLS)} disabled)")

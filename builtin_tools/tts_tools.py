@@ -338,33 +338,9 @@ def register_all(registry) -> None:
             "required": ["text"],
         },
     )
-    registry.register_function(
-        func=yandex_transcribe,
-        name="yandex_transcribe",
-        description="Transcribe audio file to text using Yandex SpeechKit STT (free tier). Supports OGG/MP3/WAV from local file or URL. Returns recognized text.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "audio_path": {
-                    "type": "string",
-                    "description": "Path to audio file (OGG/WAV/MP3). Required if url not provided.",
-                },
-                "url": {
-                    "type": "string",
-                    "description": "Public URL of audio file (OGG/WAV/MP3). Required if audio_path not provided. If both provided, url is used.",
-                },
-                "lang": {
-                    "type": "string",
-                    "description": "Recognition language (default: ru-RU)",
-                },
-                "topic": {
-                    "type": "string",
-                    "description": "Topic domain (default: general)",
-                },
-            },
-            "required": [],  # at least one of audio_path or url must be provided (validated in function)
-        },
-    )
+    # yandex_transcribe ОТКЛЮЧЁН: нет YANDEX_SPEECH_API_KEY в .env, инструмент
+    # всегда возвращал ошибку. Голосовые в MAX распознаются Groq Whisper
+    # в server/sources/max.py (transcribe_bytes) до попадания в агент.
     registry.register_function(
         func=tts_speak_aloud,
         name="tts_speak_aloud",
@@ -380,4 +356,5 @@ def register_all(registry) -> None:
             "required": ["text"],
         },
     )
-    logger.info("TTS/STT tools registered: tts_generate, yandex_transcribe, tts_speak_aloud")
+    logger.info("TTS tools registered: tts_generate, tts_speak_aloud "
+                "(yandex_transcribe disabled: no YANDEX_SPEECH_API_KEY)")
