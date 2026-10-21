@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import time
+import uuid
 from contextlib import suppress
 from typing import Any
 
@@ -64,15 +65,12 @@ async def _authenticate(websocket: WebSocket) -> dict[str, Any] | None:
     return hello
 
 
-@router.websocket("/ws/voice")
-async def voice_ws(websocket: WebSocket) -> None:
-    await websocket.accept()
-    hello = await _authenticate(websocket)
-    if hello is None:
-        return
+async def _serve_voice(websocket: WebSocket, client_id: str, name: str) -> None:
+    """Общий цикл голосовой сессии: VAD -> STT -> очередь агента -> TTS.
 
-    client_id = str(hello.get("client_id") or "voice-client")
-    name = str(hello.get("name") or client_id)
+    Используется и desktop-роутом (/ws/voice), и браузерным (/ws/web-voice),
+    чтобы протокол и пайплайн не дублировались.
+    """
     send_lock = asyncio.Lock()
 
     async def send_json(payload: dict[str, Any]) -> None:
@@ -260,6 +258,12 @@ async def voice_ws(websocket: WebSocket) -> None:
                 continue
             action = data.get("action")
 
+            # Браузерная сборка MAX WebApp может прислать initData. В MAX
+            # браузерного клиента не пускаем, поэтому сообщение игнорируем.
+            if data.get("type") == "auth":
+                logger.debug(f"voice {client_id}: auth message ignored")
+                continue
+
             if action == "listen_start":
                 session_open = True
                 if turn_task is not None and not turn_task.done():
@@ -292,3 +296,37 @@ async def voice_ws(websocket: WebSocket) -> None:
             with suppress(asyncio.CancelledError):
                 await turn_task
         logger.info(f"voice client disconnected: {client_id!r} ({name})")
+
+
+def _web_client_id(websocket: WebSocket) -> str:
+    """Короткий идентификатор браузерного клиента: ?client=... или случайный."""
+    requested = (websocket.query_params.get("client") or "").strip()
+    safe = "".join(ch for ch in requested if ch.isalnum() or ch in "-_")[:32]
+    return f"web:{safe or uuid.uuid4().hex[:8]}"
+
+
+@router.websocket("/ws/voice")
+async def voice_ws(websocket: WebSocket) -> None:
+    """Desktop-клиенты: обязательный HELLO с CLIENT_TOKEN."""
+    await websocket.accept()
+
+    # Страница /inysha/voice/ (сборка Vite) ходит именно сюда с ?dev=1 и не
+    # умеет HELLO, поэтому для неё включаем браузерный режим без токена.
+    if websocket.query_params.get("dev") == "1":
+        await _serve_voice(websocket, _web_client_id(websocket), "web")
+        return
+
+    hello = await _authenticate(websocket)
+    if hello is None:
+        return
+
+    client_id = str(hello.get("client_id") or "voice-client")
+    name = str(hello.get("name") or client_id)
+    await _serve_voice(websocket, client_id, name)
+
+
+@router.websocket("/ws/web-voice")
+async def web_voice_ws(websocket: WebSocket) -> None:
+    """Браузерный вариант: без HELLO и CLIENT_TOKEN (в MAX не пускаем)."""
+    await websocket.accept()
+    await _serve_voice(websocket, _web_client_id(websocket), "web")

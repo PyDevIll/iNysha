@@ -19,6 +19,8 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from server import config
@@ -43,6 +45,28 @@ app.include_router(max_router)
 app.include_router(api_router)
 app.include_router(client_router)
 app.include_router(voice_router)
+
+# ── Статика и браузерный голосовой чат ─────────────────────────────────
+# Готовая сборка Vite лежит в static/voice/ (index.html + assets/).
+STATIC_DIR = config.ROOT / "static"
+VOICE_DIR = STATIC_DIR / "voice"
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# index.html сборки ссылается на абсолютные пути /assets/*.
+app.mount("/assets", StaticFiles(directory=VOICE_DIR / "assets"), name="assets")
+
+
+@app.get("/voice", include_in_schema=False)
+@app.get("/voice/", include_in_schema=False)
+async def voice_page() -> FileResponse:
+    """Страница голосового чата (снаружи — /inysha/voice/)."""
+    return FileResponse(VOICE_DIR / "index.html")
+
+
+@app.get("/audio-processor.js", include_in_schema=False)
+async def audio_processor() -> FileResponse:
+    """AudioWorklet: сборка грузит его с корня, а не из /static/voice/."""
+    return FileResponse(VOICE_DIR / "audio-processor.js")
 
 
 @app.get("/api/health")
