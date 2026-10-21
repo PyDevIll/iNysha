@@ -200,8 +200,9 @@ def _decode_output(data: bytes) -> str:
 
 
 async def schedule_task(prompt: str, delay_minutes: int = 10, chat_id: str = "") -> str:
-    """Schedule an LLM self-call. On the next user message after delay expires,
-    the prompt is injected as if the user asked it. No external scheduler needed."""
+    """Schedule an LLM self-call. The scheduler fires the prompt automatically
+    after delay_minutes (15 s tick) with no incoming message; the result goes to
+    chat_id, or to the reasoning chat when chat_id is empty."""
     from lib.scheduler import get_scheduler
     sched = get_scheduler()
     task = sched.add_task(prompt, delay_minutes, chat_id or None)
@@ -268,7 +269,7 @@ TOOL_DEFINITIONS = [
         },
         "required": ["command"],
     }),
-    ("schedule_task", schedule_task, "Schedule an LLM self-call with arbitrary prompt after delay_minutes. On the next user message after the delay, the prompt is injected as if the user asked it.", {
+    ("schedule_task", schedule_task, "Schedule an LLM self-call with arbitrary prompt after delay_minutes. The scheduler fires it automatically (15 s tick) with no incoming message; the result goes to chat_id, or to the reasoning chat when empty.", {
         "type": "object",
         "properties": {
             "prompt": {"type": "string", "description": "The prompt/question to ask the LLM when the time comes"},
