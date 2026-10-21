@@ -107,7 +107,9 @@ class Agent:
         self._helper_agent: Optional[Agent] = None
         self.messages = ContextPool()
 
-        # Load last memory into context (from previous compression)
+        # Load legacy last_memory (for backward compatibility). ContextPool
+        # отфильтрует system/base-промпты, а прошлая выжимка из
+        # last_compression.txt уже загружена один раз в _compressed_dicts.
         if self._last_memory:
             self.messages.assign_messages(construct_history(self._last_memory))
 
@@ -219,6 +221,9 @@ class Agent:
                 content_parts.append(f"**Tool Results:**\n{comp_dict['tool_results']}")
             if comp_dict.get("decisions"):
                 content_parts.append(f"**Decisions:**\n{comp_dict['decisions']}")
+            # narrative уже хранится в сжатом блоке — не теряем его при сборке.
+            if comp_dict.get("narrative"):
+                content_parts.append(f"**Narrative:**\n{comp_dict['narrative']}")
             if not content_parts and comp_dict.get("raw_text"):
                 content_parts.append(comp_dict["raw_text"])
             if not content_parts:

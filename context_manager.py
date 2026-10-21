@@ -445,8 +445,21 @@ class ContextPool:
         self._periodic_save()
 
     def assign_messages(self, messages: list[dict]) -> None:
-        """Bulk load messages (e.g., from last memory)."""
-        self._all_entries = [self._dict_to_entry(m) for m in messages]
+        """Bulk load messages (e.g., from last memory).
+
+        В ``_all_entries`` храним только реальный лог диалога. System/base-
+        промпты собираются отдельно в Agent каждый запрос; если записать их
+        сюда, они дублируют сжатый контекст и навсегда оседают в
+        emergency_save.json.
+        """
+        entries = [self._dict_to_entry(m) for m in messages]
+        kept = [e for e in entries if not self._is_base_prompt(e)]
+        dropped = len(entries) - len(kept)
+        if dropped:
+            logger.info(
+                f"assign_messages: отфильтровано system/base-промптов: {dropped}"
+            )
+        self._all_entries = kept
         self._token_counts.clear()
         # No orphan deletion – tool messages are kept.
 
@@ -766,10 +779,22 @@ class ContextPool:
         try:
             raw = json.loads(save_file.read_text(encoding='utf-8'))
             if "all_entries" in raw:
-                self._all_entries = [self._dict_to_entry(m) for m in raw["all_entries"]]
+                loaded = raw["all_entries"]
             else:
                 # backward-compat: whole file was list of entries
-                self._all_entries = [self._dict_to_entry(m) for m in raw]
+                loaded = raw
+            entries = [self._dict_to_entry(m) for m in loaded]
+            # Обратная совместимость: старые emergency_save.json содержали
+            # system/base-промпт (в т.ч. PREVIOUS MEMORY SUMMARY) в all_entries.
+            # Такие записи не являются частью лога диалога — отфильтровываем,
+            # чтобы они не раздували контекст и не дублировали _compressed_dicts.
+            kept = [e for e in entries if not self._is_base_prompt(e)]
+            dropped = len(entries) - len(kept)
+            if dropped:
+                logger.info(
+                    f"Crash recovery: отфильтровано system/base-промптов: {dropped}"
+                )
+            self._all_entries = kept
             if "compressed_dicts" in raw:
                 self._compressed_dicts = raw["compressed_dicts"]
             else:
@@ -867,6 +892,16 @@ class ContextPool:
         return self._persistent.get(key)
 
     # ── Internals ──────────────────────────────────────────────────
+    @staticmethod
+    def _is_base_prompt(entry: MemoryEntry) -> bool:
+        """Является ли запись статическим system/base-промптом.
+
+        В логе диалога роли user/assistant/tool; role=system появляется только
+        если кто-то передал base-промпт через ``assign_messages`` или он остался
+        в старом emergency_save.json. В _all_entries такие записи не нужны.
+        """
+        return entry.role == "system"
+
     def _dict_to_entry(self, msg: dict) -> MemoryEntry:
         """Convert raw dict to MemoryEntry. Preserves tool_calls for round-trip."""
         msg_time = msg.get("time", datetime.now().strftime("%d.%m.%Y, %H:%M"))

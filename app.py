@@ -138,9 +138,10 @@ async def start_app():
             ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),
             ("\n## **Tools Guidelines & Best Practices**\n", "system_prompts/tools_guidelines.md"),
         ],
-        last_memory=[
-            ("# **PREVIOUS MEMORY SUMMARY**\n", "data/last_compression.txt"),
-        ],
+        # last_compression.txt загружает ровно один раз ContextPool
+        # (_seed_from_last_compression -> _compressed_dicts). Не передаём его
+        # через last_memory, иначе он попадал в all_entries как system-промпт
+        # и дублировался в emergency_save.json.
         use_tools=True,
         save_history=True,
     )

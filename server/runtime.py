@@ -162,7 +162,6 @@ class Runtime:
             api_key=os.getenv("DEEPSEEK_API_KEY_HELPER") or None,
         )
 
-        memory_file = config.DATA_DIR / "last_compression.txt"
         self.agent = Agent(
             name="DELIRIA",
             base_prompts=[
@@ -170,11 +169,12 @@ class Runtime:
                 ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),
                 ("\n## **Tools Guidelines & Best Practices**\n", "system_prompts/tools_guidelines.md"),
             ],
-            last_memory=(
-                [("# **PREVIOUS MEMORY SUMMARY**\n", str(memory_file))]
-                if memory_file.exists()
-                else []
-            ),
+            # last_compression.txt загружает ровно один раз сам ContextPool
+            # (_seed_from_last_compression -> _compressed_dicts). Через
+            # last_memory его передавать нельзя: construct_history() превращает
+            # текст в system/base-промпт, который оседал в all_entries[0] и
+            # навсегда сохранялся в emergency_save.json (дубль + лишний токен-
+            # расход). Базовые промпты собираются отдельно в Agent каждый запрос.
             use_tools=True,
             save_history=True,
         )
