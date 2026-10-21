@@ -81,6 +81,21 @@ COMPRESS_TRIGGER_RATIO = 0.90        # compress when assembled context >= this s
 MAX_SUMMARY_CHARS = 4000            # warn when a single summary is larger than this
 MAX_NARRATIVE_CHARS = 500           # narrative is capped to ~1-2 sentences
 
+# Аварийный снимок не должен расти вместе со всем логом: пишем только
+# последние N записей (свежий хвост диалога, достаточный для восстановления).
+EMERGENCY_KEEP_ENTRIES = 40
+# После успешной компрессии в мастере лога остаются только последние
+# N записей — остальное уже «съедено» сжатой выжимкой.
+COMPRESS_KEEP_ENTRIES = 5
+
+INTERRUPTED_TOOL_RESULT = (
+    "Error: tool call was interrupted before a result was recorded "
+    "(agent restart). Treat it as failed and retry if still needed."
+)
+
+# ``[Time: ...]`` marker prepended by _dict_to_entry on every round-trip.
+_TIME_PREFIX_RE = re.compile(r"^(?:\[Time: [^\]]*\]\s*)+")
+
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 # ── Memory Layer enum ──────────────────────────────────────────────────
@@ -141,6 +156,90 @@ def _is_likely_json(text: str) -> bool:
         except json.JSONDecodeError:
             return False
     return False
+
+
+def _strip_time_prefixes(text: str) -> str:
+    """Drop leading ``[Time: ...]`` markers from a previous round-trip.
+
+    ``_dict_to_entry`` prepends one on every entry→dict→entry conversion, so
+    without this the same content accumulates ``[Time: ...][Time: ...]`` and
+    grows on every restore.
+    """
+    return _TIME_PREFIX_RE.sub("", text or "")
+
+
+def repair_tool_sequence(messages: list[dict]) -> list[dict]:
+    """Return ``messages`` with every assistant ``tool_calls`` group answered.
+
+    DeepSeek/OpenAI reject the whole request when an assistant message with
+    ``tool_calls`` is not immediately followed by one ``tool`` message per
+    ``tool_call_id``. Two kinds of damage occur in a long-lived log:
+
+    * the process died between persisting the assistant tool call and its
+      result (crash or, as happened here, a self-restart executed by a tool) —
+      the call has no reply and the request fails with HTTP 400;
+    * a sliding-window / compression boundary cut a group in half — a tool
+      result has no assistant call.
+
+    Unanswered calls get a synthetic ``tool`` message; orphaned tool messages
+    become plain user messages. Everything else is preserved verbatim.
+    """
+    repaired: list[dict] = []
+    pending: dict[str, str] = {}      # tool_call_id -> function name
+
+    def flush_pending() -> None:
+        for call_id, name in pending.items():
+            logger.warning(
+                f"repair_tool_sequence: synthesising interrupted result for "
+                f"{name or 'unknown'} ({call_id})"
+            )
+            repaired.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name or "unknown",
+                "content": INTERRUPTED_TOOL_RESULT,
+            })
+        pending.clear()
+
+    for msg in messages:
+        role = msg.get("role")
+
+        if role == "tool":
+            call_id = msg.get("tool_call_id")
+            if call_id and call_id in pending:
+                del pending[call_id]
+                repaired.append(msg)
+            else:
+                logger.warning(
+                    f"repair_tool_sequence: orphaned tool result "
+                    f"({msg.get('name') or 'unknown'}, {call_id}) → user message"
+                )
+                repaired.append({
+                    "role": "user",
+                    "content": (
+                        f"[Tool result from {msg.get('name') or 'unknown'}]:\n"
+                        f"{msg.get('content') or ''}"
+                    ),
+                })
+            continue
+
+        # A non-tool message closes the current tool-call group.
+        if pending:
+            flush_pending()
+
+        repaired.append(msg)
+
+        if role == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                if not isinstance(tc, dict):
+                    tc = tc.model_dump() if hasattr(tc, "model_dump") else {}
+                call_id = tc.get("id")
+                function = tc.get("function") or {}
+                if call_id:
+                    pending[call_id] = function.get("name", "")
+
+    flush_pending()
+    return repaired
 
 
 # ── Observation Masker ─────────────────────────────────────────────────
@@ -371,6 +470,25 @@ class ContextPool:
         """Entries older than the sliding window, with tool outputs masked."""
         return [self._masker.mask(e) for e in self._all_entries[: self._split]]
 
+    def snapshot(self) -> tuple[list[MemoryEntry], list[MemoryEntry]]:
+        """Return ``(masked, sliding)`` from ONE consistent view of the log.
+
+        A background compression task may replace ``_all_entries`` at any
+        moment. Reading ``masked_entries`` and ``sliding_window`` separately
+        can mix two log generations (duplicated or dropped messages), so the
+        prompt builders must take a single snapshot instead.
+        """
+        entries = list(self._all_entries)
+        split = 0
+        if len(entries) > self.window_size:
+            split = (
+                (len(entries) - self.window_size) // self.mask_batch_size
+            ) * self.mask_batch_size
+        return (
+            [self._masker.mask(e) for e in entries[:split]],
+            entries[split:],
+        )
+
     @property
     def length(self) -> int:
         return len(self._all_entries)
@@ -402,9 +520,10 @@ class ContextPool:
         total += _token_count(self._persistent.as_context_string())
         for d in self._compressed_dicts:
             total += self._compressed_dict_tokens(d)
-        for entry in self.masked_entries:
+        masked, sliding = self.snapshot()
+        for entry in masked:
             total += self._token_count_entry(entry)
-        for entry in self.sliding_window:
+        for entry in sliding:
             total += self._token_count_entry(entry)
         return total
 
@@ -459,9 +578,10 @@ class ContextPool:
             logger.info(
                 f"assign_messages: отфильтровано system/base-промптов: {dropped}"
             )
-        self._all_entries = kept
+        self._all_entries = self._repair_entries(kept)
         self._token_counts.clear()
-        # No orphan deletion – tool messages are kept.
+        # Orphaned tool messages are converted to user messages by the repair;
+        # valid tool calls keep their pairing intact.
 
     def get_chat_history(self, messages: Optional[list[dict]] = None) -> str:
         """Render chat history as markdown string (for compression)."""
@@ -482,12 +602,13 @@ class ContextPool:
         # Convert compressed dicts to MemoryEntry list for assembly
         compressed_mems = [self._compressed_dict_to_entry(d) for d in self._compressed_dicts]
         logger.debug(f"build_context: compressed entries count = {len(self._compressed_dicts)}")
+        masked, sliding = self.snapshot()
         return self._assembler.assemble(
             system_prompt=system_prompt,
             persistent=persistent,
             compressed=compressed_mems,
-            masked=self.masked_entries,
-            sliding=self.sliding_window,
+            masked=masked,
+            sliding=sliding,
         )
 
     # ── Compression ────────────────────────────────────────────────
@@ -581,9 +702,15 @@ class ContextPool:
 
             # Keep the sliding window; the batch is replaced by the summary.
             kept = self._all_entries[split:]
-            self._all_entries = kept
+            # Требование: после компрессии остаются только 5 последних entries.
+            if len(kept) > COMPRESS_KEEP_ENTRIES:
+                kept = kept[-COMPRESS_KEEP_ENTRIES:]
+            # Обрезка могла оставить в начале tool-результат без assistant
+            # tool_call — такой «сирота» невалиден для провайдера, отбрасываем.
+            while kept and kept[0].role == "tool":
+                kept = kept[1:]
+            self._all_entries = self._repair_entries(kept)
             self._token_counts.clear()
-            # No orphan deletion – tool messages are kept.
 
             # Save to disk
             comp_file = self._data_dir / "compressed_history.txt"
@@ -794,7 +921,9 @@ class ContextPool:
                 logger.info(
                     f"Crash recovery: отфильтровано system/base-промптов: {dropped}"
                 )
-            self._all_entries = kept
+            # A crash between an assistant tool call and its result leaves the
+            # call unanswered; the provider rejects such a history with HTTP 400.
+            self._all_entries = self._repair_entries(kept)
             if "compressed_dicts" in raw:
                 self._compressed_dicts = raw["compressed_dicts"]
             else:
@@ -865,12 +994,18 @@ class ContextPool:
             logger.info("Normalized legacy compressed summaries (raw_text -> sections)")
 
     def _emergency_save(self) -> None:
-        """Save full state as JSON (both entries and compressed dicts)."""
+        """Save full state as JSON (both entries and compressed dicts).
+
+        В файл попадают только последние ``EMERGENCY_KEEP_ENTRIES`` записей:
+        полный ``_all_entries`` неограниченно рос и тянул в снимок записи,
+        которые уже были сжаты в ``_compressed_dicts``.
+        """
         with self._save_lock:
             save_file = self._data_dir / EMERGENCY_FILE
             try:
+                entries = self._all_entries[-EMERGENCY_KEEP_ENTRIES:]
                 raw = {
-                    "all_entries": [self._entry_to_dict(e) for e in self._all_entries],
+                    "all_entries": [self._entry_to_dict(e) for e in entries],
                     "compressed_dicts": self._compressed_dicts,
                 }
                 save_file.write_text(json.dumps(raw, ensure_ascii=False, default=str), encoding='utf-8')
@@ -905,8 +1040,11 @@ class ContextPool:
     def _dict_to_entry(self, msg: dict) -> MemoryEntry:
         """Convert raw dict to MemoryEntry. Preserves tool_calls for round-trip."""
         msg_time = msg.get("time", datetime.now().strftime("%d.%m.%Y, %H:%M"))
-        if msg.get("content", None):
-            msg_content = f"[Time: {msg_time}]" + msg["content"]
+        raw_content = msg.get("content") or ""
+        if raw_content:
+            # Strip markers from earlier round-trips: the prefix must never
+            # stack up every time the log is restored/re-assigned.
+            msg_content = f"[Time: {msg_time}]" + _strip_time_prefixes(raw_content)
         else:
             msg_content = ""
         return MemoryEntry(
@@ -918,6 +1056,21 @@ class ContextPool:
             tool_call_id=msg.get("tool_call_id", ""),
             tool_calls=msg.get("tool_calls", []),
         )
+
+    def _repair_entries(self, entries: list[MemoryEntry]) -> list[MemoryEntry]:
+        """Apply ``repair_tool_sequence`` to the persisted master log.
+
+        Called on load paths only (crash recovery / bulk assign): repairing on
+        every ``append`` would synthesise "interrupted" results for tool calls
+        whose results simply have not been appended yet.
+        """
+        if not entries:
+            return entries
+        as_dicts = [self._entry_to_dict(e) for e in entries]
+        fixed = repair_tool_sequence(as_dicts)
+        if all(a is b for a, b in zip(as_dicts, fixed)):
+            return entries
+        return [self._dict_to_entry(m) for m in fixed]
 
     def _compressed_dict_to_entry(self, d: dict) -> MemoryEntry:
         """Convert compressed dict to MemoryEntry for context assembly."""

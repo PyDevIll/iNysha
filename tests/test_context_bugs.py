@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -25,7 +26,12 @@ if str(ROOT) not in sys.path:
 
 import agent as agent_module
 import context_manager
-from context_manager import ContextPool
+from context_manager import (
+    COMPRESS_KEEP_ENTRIES,
+    EMERGENCY_KEEP_ENTRIES,
+    ContextPool,
+    MemoryEntry,
+)
 
 
 SUMMARY_TEXT = """## Key Facts
@@ -166,6 +172,241 @@ class ContextBugsTest(unittest.TestCase):
         self.assertEqual(
             [entry["role"] for entry in written["all_entries"]], ["user"]
         )
+
+    # ── tool-call / tool-result pairing ───────────────────────────
+    @staticmethod
+    def _dangling_tool_call() -> dict:
+        """An assistant tool call whose result was never written (crash)."""
+        return {
+            "role": "assistant",
+            "content": "",
+            "time": "21.10.2026, 06:50",
+            "tool_calls": [
+                {
+                    "id": "call_interrupted",
+                    "type": "function",
+                    "function": {"name": "exec_python", "arguments": "{}"},
+                }
+            ],
+        }
+
+    def test_repair_tool_sequence_answers_dangling_call(self) -> None:
+        repaired = context_manager.repair_tool_sequence(
+            [
+                {"role": "user", "content": "start"},
+                self._dangling_tool_call(),
+                {"role": "user", "content": "next"},
+            ]
+        )
+
+        self.assertEqual(
+            [m["role"] for m in repaired], ["user", "assistant", "tool", "user"]
+        )
+        self.assertEqual(repaired[2]["tool_call_id"], "call_interrupted")
+        self.assertEqual(repaired[2]["name"], "exec_python")
+        agent_module.validate_message_sequence(repaired)
+
+    def test_repair_tool_sequence_converts_orphan_tool(self) -> None:
+        repaired = context_manager.repair_tool_sequence(
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "missing_call",
+                    "name": "exec_python",
+                    "content": "orphan output",
+                },
+                {"role": "user", "content": "hi"},
+            ]
+        )
+
+        self.assertEqual([m["role"] for m in repaired], ["user", "user"])
+        self.assertIn("orphan output", repaired[0]["content"])
+
+    def test_validate_message_sequence_rejects_unanswered_call(self) -> None:
+        with self.assertRaises(ValueError):
+            agent_module.validate_message_sequence([self._dangling_tool_call()])
+
+    def test_restore_repairs_crash_interrupted_tool_call(self) -> None:
+        save = {
+            "all_entries": [
+                self._dangling_tool_call(),
+                {"role": "user", "content": "next", "time": "21.10.2026, 07:14"},
+            ],
+            "compressed_dicts": [],
+        }
+        (self.data_dir / "emergency_save.json").write_text(
+            json.dumps(save, ensure_ascii=False), encoding="utf-8"
+        )
+
+        pool = self._make_pool()
+
+        self.assertEqual(
+            [entry.role for entry in pool._all_entries],
+            ["assistant", "tool", "user"],
+        )
+        agent_module.validate_message_sequence(
+            [pool._entry_to_openai_dict(entry) for entry in pool._all_entries]
+        )
+
+    def test_agent_build_repairs_dangling_tool_call(self) -> None:
+        with mock.patch.object(context_manager, "DATA_DIR", self.data_dir):
+            agent = agent_module.Agent(
+                name="TEST",
+                system_prompt="test system prompt",
+                use_tools=False,
+                save_history=False,
+                api_key="test-key",
+                base_url="http://127.0.0.1:1/v1",
+            )
+
+        agent.messages.append(self._dangling_tool_call())
+        agent.messages.append({"role": "user", "content": "next"})
+
+        messages = agent._build_messages_for_llm()
+
+        agent_module.validate_message_sequence(messages)
+        self.assertTrue(
+            any(
+                m.get("role") == "tool"
+                and m.get("tool_call_id") == "call_interrupted"
+                for m in messages
+            )
+        )
+
+    def test_time_prefix_not_stacked_on_round_trip(self) -> None:
+        pool = self._make_pool()
+        pool.append(
+            {"role": "user", "content": "hello", "time": "21.10.2026, 07:00"}
+        )
+
+        entry = pool._all_entries[0]
+        once = pool._dict_to_entry(pool._entry_to_dict(entry))
+        twice = pool._dict_to_entry(pool._entry_to_dict(once))
+
+        self.assertEqual(twice.content.count("[Time:"), 1)
+
+    # ── рост emergency_save.json / обрезка после компрессии ───────
+    def test_emergency_save_keeps_only_last_40_entries(self) -> None:
+        """Из 500 записей в файл попадают ровно последние EMERGENCY_KEEP_ENTRIES."""
+        pool = self._make_pool()
+        pool._all_entries = [
+            MemoryEntry(
+                role="user",
+                content=f"entry-{i}",
+                time="21.10.2026, 08:00",
+            )
+            for i in range(500)
+        ]
+
+        pool._emergency_save()
+
+        written = json.loads(
+            (self.data_dir / "emergency_save.json").read_text(encoding="utf-8")
+        )
+        entries = written["all_entries"]
+
+        self.assertEqual(EMERGENCY_KEEP_ENTRIES, 40)
+        self.assertEqual(len(entries), EMERGENCY_KEEP_ENTRIES)
+        self.assertEqual(
+            [entry["content"] for entry in entries],
+            [f"entry-{i}" for i in range(500 - EMERGENCY_KEEP_ENTRIES, 500)],
+        )
+
+    def test_compress_keeps_at_most_five_entries(self) -> None:
+        """После compress() в _all_entries остаются только 5 последних записей."""
+        pool = self._make_pool()
+        entries = [
+            MemoryEntry(role="user", content=f"old-{i}", time="21.10.2026, 08:00")
+            for i in range(50)
+        ]
+        # Позиция 45 — tool-результат без assistant tool_call. Обрезка до
+        # последних 5 записей начнётся именно с него: «сироту» нужно отбросить.
+        entries[45] = MemoryEntry(
+            role="tool",
+            content="orphan tool output",
+            time="21.10.2026, 08:00",
+            tool_name="exec_python",
+            tool_call_id="call_orphan",
+        )
+        pool._all_entries = entries
+
+        asyncio.run(pool.compress(_FakeHelper(SUMMARY_TEXT), force=True))
+
+        self.assertEqual(COMPRESS_KEEP_ENTRIES, 5)
+        self.assertLessEqual(len(pool._all_entries), COMPRESS_KEEP_ENTRIES)
+        self.assertNotEqual(pool._all_entries[0].role, "tool")
+        agent_module.validate_message_sequence(
+            [pool._entry_to_openai_dict(entry) for entry in pool._all_entries]
+        )
+
+        # Снимок на диск тоже не должен вернуть старые записи.
+        pool._emergency_save()
+        written = json.loads(
+            (self.data_dir / "emergency_save.json").read_text(encoding="utf-8")
+        )
+        self.assertLessEqual(len(written["all_entries"]), COMPRESS_KEEP_ENTRIES)
+
+    def test_restore_from_trimmed_save_is_valid(self) -> None:
+        """Восстановление из обрезанного файла не падает и валидно по tool-call."""
+        save = {
+            "all_entries": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_orphan",
+                    "name": "exec_python",
+                    "content": "orphan output after trim",
+                },
+                {"role": "user", "content": "after trim"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_kept",
+                            "type": "function",
+                            "function": {"name": "exec_python", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_kept",
+                    "name": "exec_python",
+                    "content": "ok",
+                },
+                {"role": "user", "content": "done"},
+            ],
+            "compressed_dicts": [],
+        }
+        (self.data_dir / "emergency_save.json").write_text(
+            json.dumps(save, ensure_ascii=False), encoding="utf-8"
+        )
+
+        pool = self._make_pool()
+
+        self.assertTrue(pool._all_entries)
+        self.assertNotEqual(pool._all_entries[0].role, "tool")
+        agent_module.validate_message_sequence(
+            [pool._entry_to_openai_dict(entry) for entry in pool._all_entries]
+        )
+
+
+class _FakeHelperMessages:
+    """Заглушка messages для helper_agent: assign_messages ничего не делает."""
+
+    def assign_messages(self, messages: list[dict]) -> None:
+        self.last = messages
+
+
+class _FakeHelper:
+    """Заглушка helper_agent: сразу возвращает заданный текст сжатия."""
+
+    def __init__(self, text: str):
+        self._text = text
+        self.messages = _FakeHelperMessages()
+
+    async def llm_request(self, enable_reasoning: bool = False) -> dict:
+        return {"choices": [{"message": {"content": self._text}}]}
 
 
 if __name__ == "__main__":

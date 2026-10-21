@@ -12,7 +12,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 from loguru import logger
 
-from context_manager import ContextPool
+from context_manager import ContextPool, repair_tool_sequence
 from tool_registry import get_registry
 
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "30000"))
@@ -50,29 +50,52 @@ def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dic
 
 
 def validate_message_sequence(messages: list[dict]) -> None:
+    """Validate the assistant ``tool_calls`` ↔ ``tool`` result pairing.
+
+    Providers require each assistant tool-call group to be followed immediately
+    by exactly one ``tool`` message per ``tool_call_id``. Both a missing reply
+    and an orphaned reply invalidate the whole request, so check both
+    directions. Raises ValueError with details on the first violation.
     """
-    Check that every tool message has a preceding assistant message
-    with a tool_calls entry that includes its tool_call_id.
-    Raises ValueError with details if invalid.
-    """
-    tool_call_ids = set()
+    # tool_call_id -> index of the assistant message that declared it
+    pending: dict[str, int] = {}
+
     for i, msg in enumerate(messages):
         role = msg.get("role")
-        if role == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                tool_call_ids.add(tc["id"])
-        elif role == "tool":
+
+        if role == "tool":
             tc_id = msg.get("tool_call_id")
-            if tc_id not in tool_call_ids:
-                prev = messages[i-1] if i > 0 else None
-                if prev and prev.get("role") == "assistant" and prev.get("tool_calls"):
-                    ids_in_prev = {tc["id"] for tc in prev["tool_calls"]}
-                    if tc_id in ids_in_prev:
-                        continue
+            if tc_id not in pending:
+                prev = messages[i - 1] if i > 0 else None
                 raise ValueError(
                     f"Orphaned tool message at index {i} with tool_call_id={tc_id}. "
                     f"Preceding message: {prev} (if any)."
                 )
+            del pending[tc_id]
+            continue
+
+        if pending:
+            raise ValueError(
+                f"Assistant message(s) at index(es) "
+                f"{sorted(set(pending.values()))} have unanswered tool_calls "
+                f"{sorted(pending)} before index {i} (role={role})."
+            )
+
+        if role == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if not call_id:
+                    raise ValueError(
+                        f"Assistant message at index {i} has a tool_call without id."
+                    )
+                pending[call_id] = i
+
+    if pending:
+        raise ValueError(
+            f"Assistant message(s) at index(es) "
+            f"{sorted(set(pending.values()))} end the history with unanswered "
+            f"tool_calls {sorted(pending)}."
+        )
 
 
 class Agent:
@@ -235,8 +258,12 @@ class Agent:
                 "time": comp_dict.get("timestamp", ""),
             })
 
+        # Layer 4 + 5 are read from a single snapshot: background compression can
+        # replace the log between two property reads otherwise.
+        masked_entries, sliding_entries = self.messages.snapshot()
+
         # Layer 4: Masked observations (old tool outputs replaced with [MASKED: ...])
-        for entry in self.messages.masked_entries:
+        for entry in masked_entries:
             d = {"role": entry.role, "content": entry.content}
             if entry.tool_name:
                 d["name"] = entry.tool_name
@@ -256,36 +283,15 @@ class Agent:
 
 
         # Layer 5: Sliding window – last N entries from the master log.
-        for entry in self.messages.sliding_window:
+        for entry in sliding_entries:
             messages.append(self.messages._entry_to_openai_dict(entry))
 
 
-        # ---- NORMALISE: fix orphaned tool messages ----
-        # Convert any tool message that is not immediately preceded by an assistant
-        # with a matching tool_call_id into a user message.
-        fixed_messages = []
-        active_tool_call_ids = set()
-        for msg in messages:
-            role = msg.get("role")
-            if role == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    active_tool_call_ids.add(tc["id"])
-                fixed_messages.append(msg)
-            elif role == "tool":
-                tc_id = msg.get("tool_call_id")
-                if tc_id and tc_id in active_tool_call_ids:
-                    # This tool message is valid; keep as tool.
-                    active_tool_call_ids.discard(tc_id)
-                    fixed_messages.append(msg)
-                else:
-                    # Orphaned tool message – convert to user
-                    new_msg = {
-                        "role": "user",
-                        "content": f"[Tool result from {msg.get('name', 'unknown')}]:\n{msg.get('content', '')}"
-                    }
-                    fixed_messages.append(new_msg)
-            else:
-                fixed_messages.append(msg)
+        # ---- NORMALISE: guarantee a valid tool-call / tool-result pairing ----
+        # A crash between persisting an assistant tool call and its result (or a
+        # window/compression boundary cutting a group in half) must never reach
+        # the provider: one unanswered tool_call rejects the entire request 400.
+        fixed_messages = repair_tool_sequence(messages)
 
         # Validate the sequence (now should pass)
         try:
@@ -352,6 +358,10 @@ class Agent:
         max_iterations = 15
         iteration = 0
         enable_reasoning = bool(reasoning_callback)
+
+        # A background compression rewrites _all_entries. Wait for it before
+        # appending anything, otherwise a new turn interleaves with the trim.
+        await self.messages.await_compression()
 
         # Add user message to context
         if initial_user_request:
