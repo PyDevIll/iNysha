@@ -5,8 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>Голосовой ассистент</title>
     <script src="https://st.max.ru/js/max-web-app.js"></script>
-    <script type="module" crossorigin src="/assets/index-D5rDSySv.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-BjKsfySu.css">
+    <!-- Относительные пути: страница живёт под префиксом /inysha/voice,
+         абсолютный /assets/* ушёл бы на корень nginx мимо приложения. -->
+    <script type="module" crossorigin src="./assets/index-D5rDSySv.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BjKsfySu.css">
   </head>
   <body>
     <div id="root"></div>

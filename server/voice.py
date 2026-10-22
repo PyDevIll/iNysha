@@ -6,7 +6,7 @@ The protocol mirrors the working max-voice-assistant mini-app:
     client -> server: raw 16 kHz / 16-bit / mono PCM frames
     server -> client: {"type": "ready" | "vad" | "status" | "stt" |
                               "final" | "error" | "done"}
-    server -> client: raw 16 kHz / 16-bit / mono PCM (ElevenLabs)
+    server -> client: raw 16 kHz / 16-bit / mono PCM (Google TTS / ElevenLabs)
 
 VAD and STT run on the server, so the client stays a thin microphone/speaker
 body.  The shared agent queue is used for the reasoning turn, keeping one
@@ -38,6 +38,7 @@ from server.audio import (
 from server.queue import Request
 from server.routing import FutureReply
 from server.runtime import runtime
+from server.tts_google import stream_google_pcm
 from server.vad import VadSegmenter
 
 router = APIRouter(tags=["voice"])
@@ -65,12 +66,21 @@ async def _authenticate(websocket: WebSocket) -> dict[str, Any] | None:
     return hello
 
 
-async def _serve_voice(websocket: WebSocket, client_id: str, name: str) -> None:
+async def _serve_voice(
+    websocket: WebSocket,
+    client_id: str,
+    name: str,
+    tts_backend: str = "eleven",
+) -> None:
     """Общий цикл голосовой сессии: VAD -> STT -> очередь агента -> TTS.
 
     Используется и desktop-роутом (/ws/voice), и браузерным (/ws/web-voice),
     чтобы протокол и пайплайн не дублировались.
+
+    ``tts_backend``: "google" — бесплатный Google Translate TTS (прод),
+    "eleven" — прежний ElevenLabs (страница с ?dev=1 для сравнения).
     """
+    tts_backend = "google" if tts_backend == "google" else "eleven"
     send_lock = asyncio.Lock()
 
     async def send_json(payload: dict[str, Any]) -> None:
@@ -186,23 +196,49 @@ async def _serve_voice(websocket: WebSocket, client_id: str, name: str) -> None:
 
             await send_json({"type": "status", "status": "tts"})
             bytes_sent = 0
+            pieces_seen = 0
+
+            def on_tts_status(info: dict[str, Any]) -> None:
+                """Логируем каждый готовый кусок Google TTS."""
+                nonlocal pieces_seen
+                pieces_seen = int(info["total"])
+                logger.info(
+                    f"voice {client_id}: google TTS piece "
+                    f"{info['index'] + 1}/{info['total']} "
+                    f"({len(info['text'])} chars, mp3={info['mp3_bytes']}B, "
+                    f"pcm={info['pcm_bytes']}B, {info['elapsed_s']}s)"
+                )
+
             try:
-                async for chunk in stream_pcm(
-                    speech,
-                    output_format=config.VOICE_TTS_FORMAT,
-                    optimize_streaming_latency=config.VOICE_TTS_LATENCY,
-                ):
-                    bytes_sent += len(chunk)
-                    await send_bytes(chunk)
+                if tts_backend == "google":
+                    # Куски уходят в сокет сразу по готовности; следующий
+                    # кусок качается, пока играется текущий.
+                    async for chunk in stream_google_pcm(
+                        speech, on_status=on_tts_status
+                    ):
+                        bytes_sent += len(chunk)
+                        await send_bytes(chunk)
+                else:
+                    async for chunk in stream_pcm(
+                        speech,
+                        output_format=config.VOICE_TTS_FORMAT,
+                        optimize_streaming_latency=config.VOICE_TTS_LATENCY,
+                    ):
+                        bytes_sent += len(chunk)
+                        await send_bytes(chunk)
             except Exception as exc:
-                logger.exception("voice TTS streaming failed")
+                logger.exception(
+                    f"voice TTS streaming failed (backend={tts_backend})"
+                )
                 await send_json(
                     {"type": "error", "message": f"TTS error: {exc}"}
                 )
 
             logger.info(
                 f"voice {client_id}: answer {len(answer)} chars, "
-                f"TTS {bytes_sent} bytes PCM"
+                f"TTS backend={tts_backend}, "
+                f"pieces={pieces_seen if tts_backend == 'google' else 1}, "
+                f"{bytes_sent} bytes PCM"
             )
             await send_json(
                 {"type": "done", "elapsed": time.time() - started}
@@ -312,8 +348,14 @@ async def voice_ws(websocket: WebSocket) -> None:
 
     # Страница /inysha/voice/ (сборка Vite) ходит именно сюда с ?dev=1 и не
     # умеет HELLO, поэтому для неё включаем браузерный режим без токена.
+    # ?dev=1 — режим сравнения на ElevenLabs; без него — Google TTS.
     if websocket.query_params.get("dev") == "1":
-        await _serve_voice(websocket, _web_client_id(websocket), "web")
+        await _serve_voice(
+            websocket,
+            _web_client_id(websocket),
+            "web",
+            tts_backend="eleven",
+        )
         return
 
     hello = await _authenticate(websocket)
@@ -322,11 +364,13 @@ async def voice_ws(websocket: WebSocket) -> None:
 
     client_id = str(hello.get("client_id") or "voice-client")
     name = str(hello.get("name") or client_id)
-    await _serve_voice(websocket, client_id, name)
+    await _serve_voice(websocket, client_id, name, tts_backend="google")
 
 
 @router.websocket("/ws/web-voice")
 async def web_voice_ws(websocket: WebSocket) -> None:
     """Браузерный вариант: без HELLO и CLIENT_TOKEN (в MAX не пускаем)."""
     await websocket.accept()
-    await _serve_voice(websocket, _web_client_id(websocket), "web")
+    await _serve_voice(
+        websocket, _web_client_id(websocket), "web", tts_backend="google"
+    )

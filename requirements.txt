@@ -19,3 +19,6 @@ truststore
 # Voice pipeline (same versions as the working max-voice-assistant backend)
 groq==0.13.0
 elevenlabs==2.69.0
+
+# Google Translate TTS: конвертация MP3 -> PCM 16 кГц (ffmpeg в комплекте)
+imageio-ffmpeg
