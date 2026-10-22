@@ -23,6 +23,17 @@ from contextlib import suppress
 from typing import Any
 
 from loguru import logger
+from rich.console import Console
+from rich.prompt import Prompt
+
+# Rich's prompt uses the builtin input(), which only supports cursor movement,
+# Home/End and history when GNU readline is loaded.  On Windows the console
+# already edits input natively, so only load it where it exists.
+if sys.platform != "win32":
+    try:
+        import readline  # noqa: F401  # enables line editing for Prompt.ask
+    except ImportError:
+        pass
 
 from client.audio import Microphone, PcmPlayer, list_devices, record_wav
 from client.config import ClientConfig
@@ -38,6 +49,7 @@ except ImportError:  # websockets < 14
 class DesktopClient:
     def __init__(self, cfg: ClientConfig) -> None:
         self.cfg = cfg
+        self.console = Console()
         self.screen = ScreenCapture()
         self.mic: Microphone | None = None
         self.player: PcmPlayer | None = None
@@ -538,7 +550,9 @@ class DesktopClient:
         )
         while not self._stopping.is_set():
             try:
-                line = await asyncio.to_thread(input, "iNysha> ")
+                line = await asyncio.to_thread(
+                    Prompt.ask, "iNysha", console=self.console
+                )
             except (EOFError, OSError):
                 await asyncio.sleep(1.0)
                 continue
