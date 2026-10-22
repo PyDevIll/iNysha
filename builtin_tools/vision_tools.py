@@ -14,7 +14,13 @@ from loguru import logger
 import atexit
 
 DEEPSEEK_MODEL = "deepseek-flash"
-DEEPSEEK_MAX_TOKENS = 2048
+# Thinking mode in DeepSeek is ENABLED BY DEFAULT (effort=high). It burns the
+# whole token budget on chain-of-thought: finish_reason="length" and an empty
+# answer. Verified 22.10.2026: 2.9s / 400 completion tokens / 0 chars returned
+# with thinking on, vs 1.4s / 35 tokens / full answer with thinking disabled.
+DEEPSEEK_MAX_TOKENS = 1024
+DEEPSEEK_RETRY_MAX_TOKENS = 4096
+DEEPSEEK_THINKING_DISABLED = {"thinking": {"type": "disabled"}}
 _mss_instance = None
 
 def _get_env_or_raise(key: str) -> str:
@@ -39,25 +45,52 @@ def _deepseek_client() -> AsyncOpenAI:
 
 # Add the multi-image API caller
 async def _call_deepseek_vision(image_urls: list[str], query: str) -> str:
-    """Call DeepSeek vision with one or more images (data or public URLs)."""
+    """Call DeepSeek vision with one or more images (data or public URLs).
+
+    Thinking mode is explicitly disabled via extra_body: with it enabled the
+    model spends its entire token budget on reasoning and returns an empty
+    message with finish_reason="length". If the answer is still truncated, one
+    retry is made with a larger budget.
+    """
     client = _deepseek_client()
 
     content = [{"type": "text", "text": query}]
     for url in image_urls:
         content.append({"type": "image_url", "image_url": {"url": url}})
 
-    response = await client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        messages=[{"role": "user", "content": content}],
-        max_completion_tokens=DEEPSEEK_MAX_TOKENS,
-    )
+    messages = [{"role": "user", "content": content}]
+    budgets = [DEEPSEEK_MAX_TOKENS, DEEPSEEK_RETRY_MAX_TOKENS]
+    last_reason = None
 
-    if not response.choices:
-        raise RuntimeError("No choices in DeepSeek response")
-    message = response.choices[0].message
-    if not message.content:
-        raise RuntimeError("Empty content in DeepSeek response")
-    return message.content
+    for attempt, budget in enumerate(budgets, start=1):
+        response = await client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=messages,
+            max_completion_tokens=budget,
+            extra_body=DEEPSEEK_THINKING_DISABLED,
+        )
+
+        if not response.choices:
+            raise RuntimeError("No choices in DeepSeek response")
+
+        choice = response.choices[0]
+        message = choice.message
+        text = (message.content or "").strip()
+        finish = getattr(choice, "finish_reason", None)
+
+        if text and finish != "length":
+            return text
+
+        last_reason = f"empty/truncated answer (finish_reason={finish}, budget={budget})"
+        logger.warning(
+            f"DeepSeek vision attempt {attempt}: {last_reason}; "
+            f"images={len(image_urls)}"
+        )
+
+        if finish != "length" and not text:
+            break  # not a budget problem — retrying with more tokens won't help
+
+    raise RuntimeError(f"Empty content in DeepSeek response: {last_reason}")
 
 
 async def vision_analyze(image_path: str, query: str = "Опиши, что изображено на этой картинке. Подробно, на русском.") -> str:

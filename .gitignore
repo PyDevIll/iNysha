@@ -7,3 +7,4 @@ YANDEX_CLOUD_SERVERLESS_FUNC_REFERENCE.md
 __pycache__/
 *.pyc
 data/
+failed_*.json
