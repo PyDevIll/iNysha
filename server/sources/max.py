@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -202,6 +204,10 @@ def _check_rate_limit(chat_id: str) -> bool:
 
 async def _handle_update(update: dict[str, Any]) -> None:
     chat_id = _extract(update).get("chat_id")
+    # События-отметки (удаление, правка, вход/выход) не тратят ни семафор,
+    # ни rate-limit: LLM-запроса по ним всё равно не будет.
+    if _collect_event(update):
+        return
     try:
         if chat_id:
             _check_rate_limit(str(chat_id))
@@ -436,7 +442,10 @@ async def _flush_batch(chat_id: str, reason: str = "тишина") -> Request | 
     batch.chars = 0
     _inflight.add(chat_id)
 
-    text = "\n\n".join(messages)
+    # Отметки о событиях (удаление, правка и т.п.) идут перед сообщениями:
+    # агент видит, что успело случиться, но хода по ним не было.
+    event_notes = _drain_events(chat_id)
+    text = "\n\n".join(event_notes + messages)
     request = Request(
         text=text,
         source="max",
@@ -512,7 +521,116 @@ async def _defer_without_attachments(update: dict[str, Any]) -> None:
     await _buffer_message(chat_id, f"{header}\n{text}", data.get("trusted", False))
 
 
+# События, на которые НЕ нужен ход агента: только отметка в контексте.
+# Такие апдейты не батчатся и не порождают Request — они копятся в
+# ``_event_notes`` и уходят в контекст как "[MAX event] ..." к следующему
+# настоящему сообщению этого чата.
+_EVENT_ONLY_TYPES = {
+    "message_removed",
+    "comment_removed",
+    "message_edited",
+    "comment_edited",
+    "bot_added",
+    "bot_removed",
+    "user_added",
+    "user_removed",
+    "chat_title_changed",
+    "bot_admin_permissions_changed",
+    "dialog_cleared",
+    "dialog_removed",
+    "dialog_muted",
+    "dialog_unmuted",
+}
+
+# chat_id -> список строк-отметок, ждущих следующего сообщения.
+_event_notes: dict[str, list[str]] = {}
+_EVENT_NOTES_MAX = 20
+
+
+def _describe_event(update: dict[str, Any]) -> str | None:
+    """Короткая однострочная отметка о событии, без LLM-запроса."""
+    data = _extract(update)
+    update_type = data.get("update_type") or "unknown"
+    if update_type not in _EVENT_ONLY_TYPES:
+        return None
+    message = update.get("message") or {}
+    body = message.get("body") or {}
+    recipient = message.get("recipient") or {}
+    user = message.get("sender") or {}
+
+    message_id = data.get("message_id") or body.get("mid")
+    user_id = data.get("user_id") or user.get("user_id")
+    user_name = data.get("sender_name") or user.get("name") or "?"
+    post_id = recipient.get("post_id") or update.get("post_id")
+    title = update.get("title")
+
+    bits = [f"[MAX event] {update_type}"]
+    if message_id:
+        bits.append(f"message_id={message_id}")
+    if post_id:
+        bits.append(f"post_id={post_id}")
+    if user_id:
+        bits.append(f"user_id={user_id}")
+    if user_name and user_name != "?":
+        bits.append(f"sender={user_name}")
+    if title:
+        bits.append(f"title={title}")
+    return " | ".join(bits)
+
+
+_NOT_A_MESSAGE = re.compile(
+    r"^Received update of type '(?P<etype>[a-z_]+)':\s*(?P<body>\{.*\})\s*$",
+    re.S,
+)
+
+
+def _collect_event(update: dict[str, Any]) -> bool:
+    """Сохранить отметку о событии. True, если апдейт не требует хода агента.
+
+    Yandex-функция пересылает не-сообщенческие апдейты **строкой** вида
+    ``Received update of type 'message_removed': {...}`` в теле обычного
+    ``message_created``. Поэтому настоящий ``update_type`` ищем и в поле,
+    и в тексте.
+    """
+    data = _extract(update)
+    note = _describe_event(update)
+    if note is None:
+        text = (data.get("text") or "").strip()
+        match = _NOT_A_MESSAGE.match(text)
+        if match:
+            etype = match.group("etype")
+            if etype in _EVENT_ONLY_TYPES:
+                try:
+                    inner = json.loads(match.group("body"))
+                except json.JSONDecodeError:
+                    inner = {}
+                bits = [f"[MAX event] {etype}"]
+                for key in ("message_id", "post_id", "user_id", "chat_id"):
+                    if inner.get(key) is not None:
+                        bits.append(f"{key}={inner[key]}")
+                note = " | ".join(bits)
+    if note is None:
+        return False
+    chat_id = data.get("chat_id")
+    if not chat_id:
+        logger.info(note)
+        return True
+    notes = _event_notes.setdefault(str(chat_id), [])
+    notes.append(note)
+    if len(notes) > _EVENT_NOTES_MAX:
+        del notes[: len(notes) - _EVENT_NOTES_MAX]
+    logger.info(note)
+    return True
+
+
+def _drain_events(chat_id: str) -> list[str]:
+    """Забрать накопленные отметки чата (вызывается при сборке пачки)."""
+    return _event_notes.pop(str(chat_id), [])
+
+
 async def _process_update(update: dict[str, Any]) -> None:
+    if _collect_event(update):
+        return
     prepared = await _prepare_message(update)
     if prepared is None:
         return
@@ -552,7 +670,8 @@ async def _prepare_message(
     trusted = config.is_trusted(chat_id, str(user_id) if user_id else None)
 
     voice_transcripts: list[str] = []
-    downloaded: list[str] = []
+    downloaded: list[tuple[str, str, dict[str, Any]]] = []
+    quoted_parts: list[str] = []
     attachment_types: list[str] = []
     notes: list[str] = []
 
@@ -656,7 +775,7 @@ async def _prepare_message(
         if att_type in ("file", "image", "video"):
             result = await _download_attachment(token, url, max_bytes=limit)
             if result.get("ok"):
-                downloaded.append(result["path"])
+                downloaded.append((result["path"], att_type, payload))
             else:
                 notes.append(
                     f"{att_type}: download failed: "
@@ -664,6 +783,25 @@ async def _prepare_message(
                 )
             continue
 
+        if att_type == "link":
+            # Ответ на более раннее сообщение: MAX присылает ссылку вида
+            # https://max.ru/<chat>/<message_id>. Полную цитату подтягиваем
+            # сами, иначе агент видит только «ответ на что-то».
+            quote = await _fetch_quoted_message(payload, chat_id)
+            if quote:
+                quoted_parts.append(quote)
+            else:
+                notes.append(
+                    "link: quoted message could not be fetched "
+                    f"({payload.get('url') or payload.get('message_id') or 'no url'})"
+                )
+            continue
+
+        # Неизвестный тип вложения: дампим payload целиком в лог, чтобы потом
+        # можно было понять структуру (в сообщение не попадает).
+        logger.debug(
+            "MAX raw attachment: %s", json.dumps(payload, ensure_ascii=False)
+        )
         notes.append(f"{att_type}: attachment type not processed")
 
     parts: list[str] = []
@@ -673,10 +811,14 @@ async def _prepare_message(
         parts.append(
             "[Voice Message Transcript]\n" + "\n\n".join(voice_transcripts)
         )
+    if quoted_parts:
+        parts.append(
+            "[Quoted messages]\n" + "\n\n".join(quoted_parts)
+        )
     if downloaded:
         parts.append(
             "[Downloaded attachments]\n"
-            + "\n".join(f"- {path}" for path in downloaded)
+            + "\n".join(_describe_attachment(item) for item in downloaded)
         )
     if notes:
         parts.append(
@@ -703,6 +845,66 @@ async def _prepare_message(
     header += f" | trusted={'true' if trusted else 'false'}]"
 
     return chat_id, f"{header}\n{content}", trusted
+
+
+def _describe_attachment(item: tuple[str, str, dict[str, Any]]) -> str:
+    """Одна строка про скачанный файл: путь, тип, имя, размер, mime."""
+    path, att_type, payload = item
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    name = payload.get("filename") or "?"
+    mime = payload.get("mime_type") or payload.get("content_type") or "?"
+    return f"- {path} | type={att_type} | name={name} | size={size} | mime={mime}"
+
+
+def _parse_message_link(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Достать (chat_id, message_id) из attachment type=link.
+
+    MAX присылает ссылку вида ``https://max.ru/<chat>/<message_id>`` либо
+    поля ``chat_id`` / ``message_id`` прямо в payload.
+    """
+    chat_id = payload.get("chat_id")
+    message_id = payload.get("message_id")
+    url = payload.get("url") or payload.get("link") or ""
+    if url:
+        parts = [p for p in url.split("?")[0].split("/") if p]
+        if not message_id and parts:
+            message_id = parts[-1]
+        if not chat_id and len(parts) >= 2:
+            chat_id = parts[-2]
+    return (
+        str(chat_id) if chat_id is not None else None,
+        str(message_id) if message_id is not None else None,
+    )
+
+
+async def _fetch_quoted_message(
+    payload: dict[str, Any],
+    current_chat_id: str,
+) -> str | None:
+    """Подтянуть цитируемое сообщение по attachment type=link."""
+    chat_id, message_id = _parse_message_link(payload)
+    bot = getattr(runtime, "bot", None)
+    if bot is None or not message_id:
+        return None
+    try:
+        message = await bot.get_message(message_id)
+    except Exception as exc:
+        logger.warning(f"MAX quote fetch failed: {exc}")
+        return None
+    if not message:
+        return None
+    body = message.get("body") or {}
+    sender = (message.get("sender") or {}).get("name") or "?"
+    quote_text = (body.get("text") or "").strip()
+    if not quote_text:
+        quote_text = "(без текста)"
+    return (
+        f"[in reply to | sender={sender} | message_id={message_id}"
+        f" | chat_id={chat_id or current_chat_id}]\n{quote_text}"
+    )
 
 
 async def _download_attachment(
