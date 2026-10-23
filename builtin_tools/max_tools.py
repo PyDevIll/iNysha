@@ -273,6 +273,33 @@ def _get_bot_from_registry():
     return bot
 
 
+async def max_mark_replied(
+    chat_id: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Mark a MAX chat as answered for the current turn without sending anything.
+
+    The worker sends the agent's final text through ``MaxReply.send_text``, which
+    skips any chat already present in ``ctx.sent_chats``. This tool only adds the
+    chat to that set, so the final reply is suppressed and no message is posted.
+    Useful for channel/group noise and untrusted sources, where replying would
+    bounce back as a new webhook and create a loop.
+    """
+    if not chat_id:
+        return {"ok": False, "error": "chat_id is required"}
+
+    chat_key = str(chat_id)
+    _mark_chat_replied(chat_key)
+    logger.info(
+        f"max_mark_replied: chat {chat_key} silenced for this turn"
+        + (f" ({reason})" if reason else "")
+    )
+    return {
+        "ok": True,
+        "result": {"chat_id": chat_key, "marked": True, "reason": reason or ""},
+    }
+
+
 def _mark_chat_replied(chat_id) -> None:
     """Record that this turn already answered a chat (avoids a duplicate final reply)."""
     try:
@@ -370,6 +397,29 @@ TOOL_DEFINITIONS: list[tuple] = [
                 },
             },
             "required": ["chat_id", "text"],
+        },
+    ),
+    (
+        "max_mark_replied",
+        max_mark_replied,
+        "Mark a MAX chat as already answered for the current turn WITHOUT sending anything. "
+        "The worker's final reply is then suppressed for that chat. Use it when the incoming "
+        "message needs no visible answer (channel/group noise, service banners, untrusted "
+        "sources) so that the agent does not bounce a reply back and trigger a webhook loop. "
+        "The mark lives only for the current turn.",
+        {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "string",
+                    "description": "MAX chat ID to silence for this turn (numeric string, may be negative for channels)",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional short reason, logged for diagnostics",
+                },
+            },
+            "required": ["chat_id"],
         },
     ),
     (
