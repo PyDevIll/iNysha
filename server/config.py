@@ -33,6 +33,20 @@ MAX_SEND_REASONING = os.getenv("MAX_SEND_REASONING", "0").lower() in {"1", "true
 # "poll" (default) or "webhook". Polling needs no public TLS certificate.
 MAX_TRANSPORT = os.getenv("MAX_TRANSPORT", "poll").strip().lower()
 
+# ── MAX batching ───────────────────────────────────────────────────────
+# Сообщения одного чата копятся, пока не пройдёт MAX_DEFER_SECONDS тишины,
+# и уходят в очередь одним запросом. Переполнение пачки сбрасывается сразу.
+MAX_DEFER_SECONDS = float(os.getenv("MAX_DEFER_SECONDS", "6.0"))
+MAX_BATCH_MESSAGES = int(os.getenv("MAX_BATCH_MESSAGES", "10"))
+MAX_BATCH_CHARS = int(os.getenv("MAX_BATCH_CHARS", "4000"))
+
+# Защита от лавины: сколько апдейтов разбираем одновременно (скачивание
+# вложений и распознавание голоса идут до батчинга и стоят дорого).
+MAX_CONCURRENT_UPDATES = int(os.getenv("MAX_CONCURRENT_UPDATES", "5"))
+# Rate-limit на чат: не больше N сообщений за окно (секунды). 0 — выключить.
+MAX_CHAT_RATE_LIMIT = int(os.getenv("MAX_CHAT_RATE_LIMIT", "10"))
+MAX_CHAT_RATE_WINDOW = float(os.getenv("MAX_CHAT_RATE_WINDOW", "60"))
+
 
 def _id_set(name: str, default: str = "") -> set[str]:
     raw = os.getenv(name, default)

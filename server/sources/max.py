@@ -1,4 +1,10 @@
-"""MAX messenger source: webhook -> parse/download/transcribe -> queue."""
+"""MAX messenger source: webhook -> parse/download/transcribe -> per-chat batch.
+
+Каждое обновление разбирается сразу (скачивание вложений, транскрипция), но
+результат не уходит в очередь немедленно: текст копится в буфере своего чата,
+и через ``MAX_DEFER_SECONDS`` тишины все накопленные сообщения чата уходят
+одним ``Request``. Разные чаты никогда не склеиваются.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,7 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +33,50 @@ router = APIRouter(tags=["max"])
 _seen: OrderedDict[str, float] = OrderedDict()
 _SEEN_MAX = 1024
 _background: set[asyncio.Task] = set()
+
+
+@dataclass
+class _ChatBatch:
+    """Сообщения одного чата, ещё не отданные воркеру."""
+
+    messages: list[str] = field(default_factory=list)
+    chars: int = 0
+    # Доверие считается по каждому сообщению отдельно: в группе чужое
+    # сообщение не должно получить привилегии из-за соседа в пачке.
+    trust_flags: list[bool] = field(default_factory=list)
+    timer: asyncio.TimerHandle | None = None
+
+    @property
+    def trusted(self) -> bool:
+        return bool(self.trust_flags) and all(self.trust_flags)
+
+
+# chat_id -> активный буфер сообщений; чаты независимы друг от друга.
+_batches: dict[str, _ChatBatch] = {}
+# Rate-limit: chat_id -> список меток времени последних сообщений.
+_rate: dict[str, list[float]] = {}
+# chat_id -> полные пачки, ждущие, пока освободится занятый чат.
+_backlog: dict[str, list[_ChatBatch]] = {}
+# Чаты, для которых запрос уже стоит в очереди или обрабатывается воркером.
+_inflight: set[str] = set()
+
+
+def _reset_state() -> None:
+    """Полностью очистить буферы и дедупликацию (используется в тестах)."""
+    for batch in _batches.values():
+        if batch.timer is not None:
+            batch.timer.cancel()
+    for task in list(_background):
+        task.cancel()
+    _background.clear()
+    _batches.clear()
+    _backlog.clear()
+    _inflight.clear()
+    _seen.clear()
+    _rate.clear()
+    global _update_semaphore, _semaphore_loop
+    _update_semaphore = None
+    _semaphore_loop = None
 
 
 def _check_secret(request: HttpRequest) -> None:
@@ -75,7 +126,8 @@ async def max_webhook(request: HttpRequest):
         return {"ok": True, "duplicate": True}
 
     # Return to MAX immediately; parsing/transcription/downloads happen in the
-    # background and the actual agent turn is serialized through the queue.
+    # background, then the per-chat debounce batches them and the actual agent
+    # turn is serialized through the queue.
     task = asyncio.create_task(_handle_update(update), name=f"max-{key[:16]}")
     _background.add(task)
     task.add_done_callback(_background.discard)
@@ -83,19 +135,86 @@ async def max_webhook(request: HttpRequest):
 
 
 async def handle_update(update: dict[str, Any]) -> bool:
-    """Deduplicate and process one update (shared by webhook and poller)."""
+    """Deduplicate and process one update (shared by webhook and poller).
+
+    Идёт через те же защиты, что и webhook: rate-limit на чат и семафор.
+    Без этого поллер (``MAX_TRANSPORT=poll``) полностью обходил защиту.
+    """
     key = _update_key(update)
     if not _is_new(key):
         return False
-    await _process_update(update)
+    chat_id = _extract(update).get("chat_id")
+    try:
+        if chat_id:
+            _check_rate_limit(str(chat_id))
+    except _RateLimited:
+        await _defer_without_attachments(update)
+        return True
+    async with _get_semaphore():
+        await _process_update(update)
+    return True
+
+
+# ── Защита от лавины: глобальный семафор + rate-limit на чат ────────────────
+# Семафор ограничивает число одновременных разборов апдейтов (скачивание
+# вложений и распознавание голоса идут ДО батчинга и стоят дорого).
+_update_semaphore: asyncio.Semaphore | None = None
+_semaphore_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Ленивая инициализация: семафор привязан к текущему event loop.
+
+    Пересоздаётся, только если сменился loop (например, между тестами):
+    ``asyncio.Semaphore`` нельзя переиспользовать в другом цикле.
+    """
+    global _update_semaphore, _semaphore_loop
+    loop = asyncio.get_running_loop()
+    limit = max(1, int(config.MAX_CONCURRENT_UPDATES))
+    if _update_semaphore is None or _semaphore_loop is not loop:
+        _update_semaphore = asyncio.Semaphore(limit)
+        _semaphore_loop = loop
+    return _update_semaphore
+
+
+def _check_rate_limit(chat_id: str) -> bool:
+    """True, если чат не превысил лимит сообщений в окне."""
+    limit = int(config.MAX_CHAT_RATE_LIMIT)
+    if limit <= 0:
+        return True
+    window = float(config.MAX_CHAT_RATE_WINDOW)
+    now = time.monotonic()
+    stamps = _rate.setdefault(chat_id, [])
+    while stamps and now - stamps[0] > window:
+        stamps.pop(0)
+    if len(stamps) >= limit:
+        # Не выбрасываем сообщение: оно ещё не разобрано, но является частью
+        # разговора. Разбор откладываем (без вложений) — так теряется только
+        # текстовая часть, а не весь апдейт. Пишем в лог один раз в окно.
+        logger.warning(
+            f"MAX rate limit: чат {chat_id} превысил {limit} сообщ. за "
+            f"{window:.0f} с — разбор отложен"
+        )
+        raise _RateLimited()
+    stamps.append(now)
     return True
 
 
 async def _handle_update(update: dict[str, Any]) -> None:
+    chat_id = _extract(update).get("chat_id")
     try:
-        await _process_update(update)
-    except Exception:
-        logger.exception("MAX update processing failed")
+        if chat_id:
+            _check_rate_limit(str(chat_id))
+    except _RateLimited:
+        # Лимит исчерпан: текст всё равно попадает в пачку (без скачивания
+        # вложений и без распознавания голоса), чтобы разговор не рвался.
+        await _defer_without_attachments(update)
+        return
+    async with _get_semaphore():
+        try:
+            await _process_update(update)
+        except Exception:
+            logger.exception("MAX update processing failed")
 
 
 def _extract(update: dict[str, Any]) -> dict[str, Any]:
@@ -138,7 +257,273 @@ def _attachment_summary(attachment: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _has_pending(chat_id: str) -> bool:
+    """Есть ли у чата что отдавать: активный буфер или готовый backlog."""
+    batch = _batches.get(chat_id)
+    return bool(_backlog.get(chat_id)) or bool(batch and batch.messages)
+
+
+def _schedule_flush(chat_id: str, delay: float | None = None) -> None:
+    """(Пере)завести таймер тишины для чата."""
+    batch = _batches.get(chat_id)
+    if batch is None:
+        if not _backlog.get(chat_id):
+            return
+        batch = _batches[chat_id] = _ChatBatch()
+    if batch.timer is not None:
+        batch.timer.cancel()
+        batch.timer = None
+    if not _has_pending(chat_id):
+        return
+    if delay is None:
+        delay = config.MAX_DEFER_SECONDS
+    loop = asyncio.get_running_loop()
+    batch.timer = loop.call_later(max(0.0, delay), _on_flush_timer, chat_id)
+
+
+def _on_flush_timer(chat_id: str) -> None:
+    batch = _batches.get(chat_id)
+    if batch is None:
+        if not _backlog.get(chat_id):
+            return
+        batch = _batches[chat_id] = _ChatBatch()
+    batch.timer = None
+    if not _has_pending(chat_id):
+        return
+    task = asyncio.create_task(
+        _flush_batch_safe(chat_id, reason="тишина"), name=f"max-batch-{chat_id}"
+    )
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def _flush_batch_safe(chat_id: str, reason: str) -> None:
+    try:
+        await _flush_batch(chat_id, reason)
+    except Exception:
+        logger.exception(f"MAX: не удалось отправить пачку чата {chat_id}")
+
+
+def _append_to_batch(batch: _ChatBatch, text: str, trusted: bool) -> None:
+    """Дописать сообщение в пачку, поддерживая счётчик символов в O(1)."""
+    if batch.messages:
+        # Сообщения склеиваются через пустую строку — два символа-разделителя.
+        batch.chars += len(text) + 2
+    else:
+        batch.chars = len(text)
+    batch.messages.append(text)
+    batch.trust_flags.append(bool(trusted))
+
+
+def _batch_would_overflow(batch: _ChatBatch, text: str) -> bool:
+    """Не выйдет ли пачка за лимиты, если дописать ещё одно сообщение."""
+    return (
+        len(batch.messages) + 1 > config.MAX_BATCH_MESSAGES
+        or batch.chars + len(text) + 2 > config.MAX_BATCH_CHARS
+    )
+
+
+def _park_batch(chat_id: str, batch: _ChatBatch) -> None:
+    """Убрать пачку в backlog чата, не оставив висящий таймер тишины."""
+    if batch.timer is not None:
+        batch.timer.cancel()
+        batch.timer = None
+    _backlog.setdefault(chat_id, []).append(batch)
+
+
+async def _buffer_message(chat_id: str, text: str, trusted: bool) -> None:
+    """Добавить готовый текст в пачку чата; переполнение сбрасывается сразу."""
+    batch = _batches.get(chat_id)
+    if batch is None:
+        batch = _batches[chat_id] = _ChatBatch()
+
+    # Пока по этому чату ещё отвечает воркер, отдать пачку нельзя: копим
+    # сообщения, но не даём пачке выйти за лимиты — полная уходит в backlog
+    # и будет отправлена следующей, как только чат освободится.
+    if chat_id in _inflight:
+        if batch.messages and _batch_would_overflow(batch, text):
+            _park_batch(chat_id, batch)
+            batch = _batches[chat_id] = _ChatBatch()
+        _append_to_batch(batch, text, trusted)
+        logger.debug(
+            f"MAX: чат {chat_id} занят, {len(batch.messages)} сообщ. "
+            "ждут следующей пачки"
+        )
+        if (
+            len(batch.messages) >= config.MAX_BATCH_MESSAGES
+            or batch.chars >= config.MAX_BATCH_CHARS
+        ):
+            _park_batch(chat_id, batch)
+            _batches[chat_id] = _ChatBatch()
+        return
+
+    # Не влезает в текущую пачку — сначала отдаём её, остаток копим заново.
+    if batch.messages and _batch_would_overflow(batch, text):
+        logger.info(
+            f"MAX: пачка чата {chat_id} заполнена "
+            f"({len(batch.messages)} сообщ., {batch.chars} симв.), "
+            "сбрасываю её до лимита"
+        )
+        await _flush_batch(chat_id, reason="переполнение")
+        # После успешного сброса пачки в буфере её уже нет — заводим новую.
+        if _batches.get(chat_id) is None:
+            _batches[chat_id] = _ChatBatch()
+        batch = _batches[chat_id]
+
+    _append_to_batch(batch, text, trusted)
+
+    if (
+        len(batch.messages) >= config.MAX_BATCH_MESSAGES
+        or batch.chars >= config.MAX_BATCH_CHARS
+    ):
+        logger.info(
+            f"MAX: пачка чата {chat_id} достигла лимита "
+            f"({len(batch.messages)} сообщ., {batch.chars} симв.), "
+            "сбрасываю сразу"
+        )
+        await _flush_batch(chat_id, reason="переполнение")
+        return
+
+    if chat_id not in _inflight:
+        _schedule_flush(chat_id)
+
+
+def _take_next_batch(chat_id: str) -> _ChatBatch | None:
+    """Следующая пачка: сначала backlog (порядок), затем активный буфер."""
+    backlog = _backlog.get(chat_id)
+    if backlog:
+        batch = backlog.pop(0)
+        if not backlog:
+            _backlog.pop(chat_id, None)
+        return batch
+    batch = _batches.pop(chat_id, None)
+    if batch is None or not batch.messages:
+        return None
+    return batch
+
+
+async def _flush_batch(chat_id: str, reason: str = "тишина") -> Request | None:
+    """Отдать накопленную пачку чата в очередь одним ``Request``."""
+    batch = _batches.get(chat_id)
+    if batch is not None and batch.timer is not None:
+        batch.timer.cancel()
+        batch.timer = None
+
+    if chat_id in _inflight:
+        # Предыдущий запрос этого чата ещё в очереди или в работе: новые
+        # сообщения остаются в буфере и станут следующими пачками.
+        pending = len(batch.messages) if batch is not None else 0
+        pending += sum(len(item.messages) for item in _backlog.get(chat_id, []))
+        if pending:
+            logger.debug(
+                f"MAX: чат {chat_id} занят, {pending} сообщ. "
+                "ждут следующей пачки"
+            )
+            _schedule_flush(chat_id)
+        return None
+
+    batch = _take_next_batch(chat_id)
+    if batch is None:
+        _batches.pop(chat_id, None)
+        return None
+
+    # Копия списка: пока идёт await ниже, в batch.messages могут дописаться
+    # новые сообщения, и они не должны попасть в уже собранный текст.
+    messages = list(batch.messages)
+    trusted = batch.trusted
+    batch.messages.clear()
+    batch.trust_flags.clear()
+    batch.chars = 0
+    _inflight.add(chat_id)
+
+    text = "\n\n".join(messages)
+    request = Request(
+        text=text,
+        source="max",
+        chat_id=chat_id,
+        trusted=trusted,
+        send_reasoning=config.MAX_SEND_REASONING,
+        reply=_BatchReply(MaxReply(runtime.bot, chat_id), chat_id),
+    )
+    try:
+        await runtime.queue.put(request)
+    except Exception:
+        # Порядок важен: неудавшаяся пачка старше всего, что уже в backlog.
+        # Сообщения возвращаем обратно в batch, чтобы ничего не потерялось.
+        batch.messages[0:0] = messages
+        batch.trust_flags[0:0] = [trusted] * len(messages)
+        batch.chars = sum(len(m) for m in batch.messages) + 2 * (len(batch.messages) - 1)
+        _inflight.discard(chat_id)
+        _backlog.setdefault(chat_id, []).insert(0, batch)
+        _schedule_flush(chat_id)
+        raise
+
+    logger.info(
+        f"[{request.id}] пачка MAX из чата {chat_id} поставлена в очередь "
+        f"({len(messages)} сообщ., {len(text)} симв., причина={reason}, "
+        f"trusted={trusted})"
+    )
+    return request
+
+
+def _finish_batch(chat_id: str) -> None:
+    """Ответ по пачке отправлен — чат свободен, буфер можно отдавать."""
+    _inflight.discard(chat_id)
+    if _has_pending(chat_id):
+        _schedule_flush(chat_id, delay=0.0)
+
+
+class _BatchReply:
+    """``MaxReply``, который освобождает чат после отправки ответа."""
+
+    def __init__(self, inner: MaxReply, chat_id: str) -> None:
+        self._inner = inner
+        self._chat_id = chat_id
+
+    async def send_text(self, text: str) -> None:
+        try:
+            await self._inner.send_text(text)
+        finally:
+            _finish_batch(self._chat_id)
+
+    async def send_error(self, text: str) -> None:
+        try:
+            await self._inner.send_error(text)
+        finally:
+            _finish_batch(self._chat_id)
+
+
+class _RateLimited(Exception):
+    """Чат превысил лимит сообщений в окне — разбор нужно отложить."""
+
+
+async def _defer_without_attachments(update: dict[str, Any]) -> None:
+    """Положить в пачку только текст сообщения, без обработки вложений."""
+    data = _extract(update)
+    chat_id = data["chat_id"]
+    text = (data.get("text") or "").strip()
+    if not chat_id or not text:
+        return
+    header = (
+        f"[MAX messenger | chat_id={chat_id} | user_id={data.get('user_id')} "
+        f"| sender={data.get('sender_name')} | attachments=none "
+        f"| trusted={data.get('trusted')}]"
+    )
+    await _buffer_message(chat_id, f"{header}\n{text}", data.get("trusted", False))
+
+
 async def _process_update(update: dict[str, Any]) -> None:
+    prepared = await _prepare_message(update)
+    if prepared is None:
+        return
+    chat_id, message_text, trusted = prepared
+    await _buffer_message(chat_id, message_text, trusted)
+
+
+async def _prepare_message(
+    update: dict[str, Any],
+) -> tuple[str, str, bool] | None:
+    """Разобрать обновление в готовый текст сообщения, не отправляя его."""
     data = _extract(update)
     chat_id = data["chat_id"]
     if not chat_id:
@@ -159,7 +544,7 @@ async def _process_update(update: dict[str, Any]) -> None:
                 "MAX update without chat_id: "
                 + json.dumps(update, ensure_ascii=False)[:400]
             )
-        return
+        return None
     chat_id = str(chat_id)
 
     text: str = data["text"]
@@ -317,19 +702,7 @@ async def _process_update(update: dict[str, Any]) -> None:
     )
     header += f" | trusted={'true' if trusted else 'false'}]"
 
-    request = Request(
-        text=f"{header}\n{content}",
-        source="max",
-        chat_id=chat_id,
-        trusted=trusted,
-        send_reasoning=config.MAX_SEND_REASONING,
-        reply=MaxReply(runtime.bot, chat_id),
-    )
-    await runtime.queue.put(request)
-    logger.info(
-        f"[{request.id}] queued MAX message from chat {chat_id} "
-        f"(trusted={trusted}, {len(content)} chars)"
-    )
+    return chat_id, f"{header}\n{content}", trusted
 
 
 async def _download_attachment(
