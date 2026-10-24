@@ -31,6 +31,11 @@ DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
 
 
+# Скорость речи ElevenLabs. Документация разрешает 0.7-1.2; 1.2 - максимум.
+# Голосовой пайплайн читает короткие реплики, поэтому быстрее = живее.
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.2"))
+
+
 async def synthesize_to_file(
     text: str,
     *,
@@ -97,6 +102,7 @@ async def synthesize_to_file(
             "similarity_boost": 0.75,
             "style": 0.0,
             "use_speaker_boost": True,
+            "speed": TTS_SPEED,
         },
     }
 
@@ -198,6 +204,7 @@ async def stream_pcm(
             "similarity_boost": 0.75,
             "style": 0.0,
             "use_speaker_boost": True,
+            "speed": TTS_SPEED,
         },
     )
     async for chunk in stream:
