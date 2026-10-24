@@ -323,6 +323,9 @@ async def _deliver_tool_result(task: dict, tid: str) -> None:
         # Пустой ответ агента = молчание (VoiceHub.send_spoken это уважает).
         try:
             from server.voice import voice_hub
+            # Не наезжаем на текущую реплику: ждём, пока пользователь
+            # дослушает её, потом говорим.
+            await voice_hub.wait_idle(str(client_id), timeout=20.0)
             reply = VoiceReply(voice_hub, str(client_id))
         except Exception as e:
             logger.info(f"voice reply unavailable for {client_id}: {e}")

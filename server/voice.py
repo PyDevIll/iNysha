@@ -60,6 +60,7 @@ class VoiceHub:
         self._sessions[client_id] = {
             "speak": speak,
             "reply": reply,
+            "lock": asyncio.Lock(),
             "since": time.time(),
         }
         logger.info(f"voice hub: session {client_id} registered")
@@ -83,12 +84,29 @@ class VoiceHub:
         if not (text or "").strip():
             logger.info(f"voice hub: {client_id} stays silent (empty answer)")
             return False
+        # Пока играет предыдущая фраза, новый текст ждёт в очереди, чтобы
+        # фоновый ответ не наехал на реплику живого хода.
+        async with session["lock"]:
+            try:
+                await session["speak"](text)
+                return True
+            except Exception as exc:
+                logger.warning(f"voice hub: speak failed for {client_id}: {exc}")
+                return False
+
+    async def wait_idle(self, client_id: str, timeout: float = 30.0) -> None:
+        """Подождать, пока в сессии замолчат. Используется фоновыми ходами."""
+        session = self._sessions.get(client_id)
+        if session is None:
+            return
+        lock = session["lock"]
+        if lock.locked():
+            logger.info(f"voice hub: {client_id} is speaking, waiting to talk")
         try:
-            await session["speak"](text)
-            return True
-        except Exception as exc:
-            logger.warning(f"voice hub: speak failed for {client_id}: {exc}")
-            return False
+            await asyncio.wait_for(lock.acquire(), timeout=timeout)
+            lock.release()
+        except asyncio.TimeoutError:
+            logger.info(f"voice hub: {client_id} still busy after {timeout}s")
 
 
 voice_hub = VoiceHub()
