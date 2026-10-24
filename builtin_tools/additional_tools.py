@@ -236,6 +236,130 @@ async def cancel_scheduled_task(task_id: str) -> str:
     return json.dumps({"ok": False, "task_id": task_id, "message": "Not found or already completed"}, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# Fire-and-forget tool tasks (receipt + check_tool)
+# ---------------------------------------------------------------------------
+
+import time
+import uuid as _uuid
+from typing import Any as _Any, Dict as _Dict
+
+_TOOL_TASKS: _Dict[str, dict] = {}
+_TASKS_TTL = 3600.0          # forget finished tasks after an hour
+_MAX_FINISHED = 200          # hard cap on remembered finished tasks
+
+
+def _prune_tasks() -> None:
+    """Drop old finished tasks so the dict cannot grow forever."""
+    now = time.time()
+    finished = [(tid, t) for tid, t in _TOOL_TASKS.items() if t["status"] != "running"]
+    for tid, t in finished[:_MAX_FINISHED]:
+        pass
+    excess = len(finished) - _MAX_FINISHED
+    for tid, t in finished[:max(0, excess)]:
+        _TOOL_TASKS.pop(tid, None)
+    for tid, t in list(_TOOL_TASKS.items()):
+        if t["status"] != "running" and now - t.get("finished_at", now) > _TASKS_TTL:
+            _TOOL_TASKS.pop(tid, None)
+
+
+def _describe_task(tid: str, t: dict, with_result: bool = False) -> str:
+    age = round(time.time() - t["started_at"], 1)
+    head = f"task_id={tid} | tool={t['tool']} | status={t['status']} | elapsed={age}s"
+    if with_result:
+        if t["status"] == "ready":
+            return head + f"\nRESULT:\n{t['result']}"
+        if t["status"] == "failed":
+            return head + f"\nERROR: {t['error']}"
+    return head
+
+
+async def _run_tool_task(tid: str, tool: str, kwargs: dict) -> None:
+    """Background runner: executes the tool and stores its outcome."""
+    from tool_registry import get_registry
+    task = _TOOL_TASKS.get(tid)
+    if task is None:
+        return
+    try:
+        registry = get_registry()
+        result = await registry.call_tool(tool, **kwargs)
+        raw = str(result)
+        task["status"] = "failed" if raw.startswith("Error") else "ready"
+        task["result"] = raw
+        if raw.startswith("Error"):
+            task["error"] = raw
+    except Exception as e:
+        task["status"] = "failed"
+        task["error"] = f"{type(e).__name__}: {e}"
+        logger.error(f"tool task {tid} ({tool}) failed: {e}")
+    finally:
+        task["finished_at"] = time.time()
+        _prune_tasks()
+
+
+async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0) -> str:
+    """Launch any tool in the background and return a receipt immediately.
+
+    The agent does not wait for the tool: it gets a task_id back and keeps talking.
+    Retrieve the outcome later with check_tool(task_id) or list_tool_tasks().
+    """
+    from tool_registry import get_registry
+    registry = get_registry()
+    if registry.get_tool(tool) is None:
+        return f"Error: tool '{tool}' not found"
+
+    try:
+        kwargs = json.loads(arguments) if isinstance(arguments, str) and arguments.strip() else {}
+    except json.JSONDecodeError as e:
+        return f"Error: invalid JSON in arguments — {e}"
+    if not isinstance(kwargs, dict):
+        return "Error: arguments must be a JSON object"
+
+    if delay_seconds and float(delay_seconds) > 0:
+        await asyncio.sleep(float(delay_seconds))
+
+    tid = _uuid.uuid4().hex[:8]
+    _TOOL_TASKS[tid] = {
+        "tool": tool,
+        "args": kwargs,
+        "status": "running",
+        "result": None,
+        "error": None,
+        "started_at": time.time(),
+    }
+    asyncio.create_task(_run_tool_task(tid, tool, kwargs))
+    logger.info(f"start_tool: {tool}({json.dumps(kwargs, ensure_ascii=False)[:120]}) -> task {tid}")
+    return (f"RECEIPT: task_id={tid} | tool={tool} | status=running\n"
+            f"Не говори, что результат уже есть. Скажи, что проверяешь, и забери результат через check_tool('{tid}').")
+
+
+async def check_tool(task_id: str, wait_seconds: float = 0, consume: bool = True) -> str:
+    """Check a fire-and-forget task: running / ready / failed, with the result when ready."""
+    tid = (task_id or "").strip()
+    task = _TOOL_TASKS.get(tid)
+    if task is None:
+        return f"Error: task '{tid}' not found (expired or never existed)"
+
+    deadline = time.time() + min(float(wait_seconds or 0), 30.0)
+    while task["status"] == "running" and time.time() < deadline:
+        await asyncio.sleep(0.25)
+
+    out = _describe_task(tid, task, with_result=True)
+    if task["status"] != "running" and consume:
+        _TOOL_TASKS.pop(tid, None)
+        out += "\n(task consumed)"
+    return out
+
+
+async def list_tool_tasks() -> str:
+    """List all background tool tasks and their status."""
+    if not _TOOL_TASKS:
+        return "No background tool tasks."
+    lines = [_describe_task(tid, t) for tid, t in sorted(_TOOL_TASKS.items(), key=lambda kv: kv[1]["started_at"])]
+    running = sum(1 for t in _TOOL_TASKS.values() if t["status"] == "running")
+    return f"tasks={len(lines)} | running={running}\n" + "\n".join(lines)
+
+
 TOOL_DEFINITIONS = [
     ("exec_python", exec_python, "⚠️ WARNING: Full system access. Use ONLY on explicit user request. Execute arbitrary Python code for quick testing and debugging. "
      "Pass code as: -c \"print('hello')\", or a .py filename, or raw code string.", {
@@ -289,8 +413,29 @@ TOOL_DEFINITIONS = [
         },
         "required": ["task_id"],
     }),
+    ("start_tool", start_tool, "Launch ANY tool in the background (fire-and-forget) and get a receipt with task_id immediately, without waiting for the result. Use it when the tool is slow and you want to keep talking. Retrieve the outcome later with check_tool(task_id).", {
+        "type": "object",
+        "properties": {
+            "tool": {"type": "string", "description": "Name of the tool to run in background (e.g. tavily_search, exec_shell)"},
+            "arguments": {"type": "string", "description": "JSON object string with tool arguments, e.g. {\"query\": \"...\"} (default: {})"},
+            "delay_seconds": {"type": "number", "description": "Optional delay before starting the tool (default: 0)"},
+        },
+        "required": ["tool"],
+    }),
+    ("check_tool", check_tool, "Check the status of a background (fire-and-forget) tool task started via start_tool. Returns running/ready/failed plus the result when ready. Use it after you have already replied to the user and want the deferred result.", {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Task id returned by start_tool"},
+            "wait_seconds": {"type": "number", "description": "How long to wait for completion before returning (default: 0 — instant peek, max 30)"},
+            "consume": {"type": "boolean", "description": "Remove the task after reading a ready result (default: true)"},
+        },
+        "required": ["task_id"],
+    }),
+    ("list_tool_tasks", list_tool_tasks, "List background tool tasks (fire-and-forget) with their status: what is still running and what is ready.", {
+        "type": "object",
+        "properties": {},
+    }),
 ]
-
 
 
 def register_all(registry):
