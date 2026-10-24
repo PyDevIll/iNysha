@@ -47,9 +47,8 @@ TOOL_DEFINITIONS = [
 ]
 
 
-# Отключены: ping бесполезен, reload_tools нужен только при правке тулов
-# (достаточно рестарта сервиса).
-DISABLED_TOOLS = {"ping", "reload_tools"}
+# ping отключён: бесполезен. reload_tools нужен при правке тулов без рестарта сервиса.
+DISABLED_TOOLS = {"ping"}
 
 
 def register_all(registry):
