@@ -24,6 +24,10 @@ class ToolDef:
     group: str = ""
 
 
+# Tools exposed to the model only inside a voice turn (see get_openai_tools).
+VOICE_ONLY_TOOLS = frozenset({"start_tool", "check_tool", "list_tool_tasks"})
+
+
 class ToolRegistry:
     """Async-first tool registry with hot-reload via importlib."""
 
@@ -95,10 +99,19 @@ class ToolRegistry:
         return self._tools.get(name)
 
 
-    def get_openai_tools(self) -> list[dict]:
+    def get_openai_tools(self, voice_mode: bool | None = None) -> list[dict]:
+        """Export tools for the LLM.
+
+        ``voice_mode=True`` additionally exposes the fire-and-forget tools
+        (start_tool / check_tool / list_tool_tasks) that make the agent
+        responsive during a spoken turn. In text sessions they are hidden so
+        the model never knows they exist.
+        """
         tools = []
         names = []
         for tdef in self._tools.values():
+            if tdef.name in VOICE_ONLY_TOOLS and not voice_mode:
+                continue
             names.append(tdef.name)
             tools.append({
                 "type": "function",

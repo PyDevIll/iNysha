@@ -304,6 +304,11 @@ async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0)
     Retrieve the outcome later with check_tool(task_id) or list_tool_tasks().
     """
     from tool_registry import get_registry
+    from server.context import get_request_context
+    ctx = get_request_context()
+    if not (ctx and str(ctx.source).startswith("voice")):
+        return ("Error: start_tool is available only in a voice turn. "
+                "Call the tool directly instead — waiting for its result is fine here.")
     registry = get_registry()
     if registry.get_tool(tool) is None:
         return f"Error: tool '{tool}' not found"

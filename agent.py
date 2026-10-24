@@ -305,6 +305,16 @@ class Agent:
 
         return fixed_messages
 
+    @staticmethod
+    def _is_voice_turn() -> bool:
+        """True when the current request comes from a voice client."""
+        try:
+            from server.context import get_request_context
+            ctx = get_request_context()
+            return bool(ctx and str(ctx.source).startswith("voice"))
+        except Exception:
+            return False
+
     async def llm_request(self, enable_reasoning) -> dict:
         """Make an async LLM API call with layered context."""
         messages = self._build_messages_for_llm()
@@ -315,7 +325,8 @@ class Agent:
         logger.info(f"LLM request: {len(messages)} msgs, ~{est_tokens} tokens")
 
         registry = get_registry()   # always live
-        tools = registry.get_openai_tools() if self._use_tools else []
+        voice_mode = self._is_voice_turn()
+        tools = registry.get_openai_tools(voice_mode=voice_mode) if self._use_tools else []
         if tools:
             logger.debug(f"llm_request: passing {len(tools)} tools to API: {[t['function']['name'] for t in tools]}")
 
