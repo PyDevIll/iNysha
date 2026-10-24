@@ -61,3 +61,27 @@ class MaxReply:
 
     async def send_error(self, text: str) -> None:
         await self.send_text(f"⚠️ {text}")
+
+class VoiceReply:
+    """Доставляет ответ агента в открытую голосовую сессию.
+
+    Нужен для ходов, у которых нет своего запроса из голосового пайплайна:
+    фоновые результаты инструментов (`source="tool_result"`). Ход сам решает,
+    говорить ли вслух — если ``send_text`` получил пустую строку, звука нет.
+    """
+
+    def __init__(self, voice_hub: Any, client_id: str) -> None:
+        self.hub = voice_hub
+        self.client_id = client_id
+
+    async def send_text(self, text: str) -> None:
+        sender = getattr(self.hub, "send_spoken", None)
+        if sender is None:
+            logger.warning(
+                f"[VoiceReply] {self.client_id}: no send_spoken in hub, dropping answer"
+            )
+            return
+        await sender(self.client_id, text or "")
+
+    async def send_error(self, text: str) -> None:
+        await self.send_text(text)

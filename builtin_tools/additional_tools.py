@@ -308,20 +308,25 @@ async def _deliver_tool_result(task: dict, tid: str) -> None:
         return
 
     from server.queue import Request
-    from server.routing import NullReply, MaxReply
+    from server.routing import NullReply, MaxReply, VoiceReply
 
     chat_id = task.get("chat_id")
     client_id = task.get("client_id")
     reply = NullReply()
-    # Voice turns have no reply target of their own: the spoken answer is
-    # streamed by the voice pipeline, so a background turn only writes to
-    # the context and stays silent. MAX chats get a real reply.
     if chat_id and getattr(rt, "bot", None) is not None:
         try:
             reply = MaxReply(rt.bot, chat_id)
         except Exception:
             reply = NullReply()
-    _ = client_id  # voice results are delivered into context only
+    elif client_id:
+        # Фоновый ход в голосовой сессии: говорим вслух, если сессия жива.
+        # Пустой ответ агента = молчание (VoiceHub.send_spoken это уважает).
+        try:
+            from server.voice import voice_hub
+            reply = VoiceReply(voice_hub, str(client_id))
+        except Exception as e:
+            logger.info(f"voice reply unavailable for {client_id}: {e}")
+            reply = NullReply()
 
     payload = task.get("result") if task["status"] == "ready" else task.get("error")
     req = Request(

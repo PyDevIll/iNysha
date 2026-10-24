@@ -46,6 +46,54 @@ router = APIRouter(tags=["voice"])
 FRAME_SECONDS = 0.03
 
 
+class VoiceHub:
+    """Живые голосовые WebSocket-сессии: кому можно говорить вне запроса.
+
+    Пайплайн хода дергает ``answer``/``speak``; фоновые ходы приходят через
+    ``send_spoken`` — они не ждут ничего и говорят, только если им есть что.
+    """
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, dict[str, Any]] = {}
+
+    def register(self, client_id: str, speak, reply) -> None:
+        self._sessions[client_id] = {
+            "speak": speak,
+            "reply": reply,
+            "since": time.time(),
+        }
+        logger.info(f"voice hub: session {client_id} registered")
+
+    def unregister(self, client_id: str) -> None:
+        if self._sessions.pop(client_id, None) is not None:
+            logger.info(f"voice hub: session {client_id} closed")
+
+    def is_live(self, client_id: str) -> bool:
+        return client_id in self._sessions
+
+    def live_clients(self) -> list[str]:
+        return list(self._sessions)
+
+    async def send_spoken(self, client_id: str, text: str) -> bool:
+        """Произнести текст в сессию. Пустой текст = молчание."""
+        session = self._sessions.get(client_id)
+        if session is None:
+            logger.info(f"voice hub: no live session for {client_id}, mute")
+            return False
+        if not (text or "").strip():
+            logger.info(f"voice hub: {client_id} stays silent (empty answer)")
+            return False
+        try:
+            await session["speak"](text)
+            return True
+        except Exception as exc:
+            logger.warning(f"voice hub: speak failed for {client_id}: {exc}")
+            return False
+
+
+voice_hub = VoiceHub()
+
+
 async def _authenticate(websocket: WebSocket) -> dict[str, Any] | None:
     if not config.CLIENT_TOKEN:
         await websocket.close(code=1011, reason="CLIENT_TOKEN is not configured")
@@ -92,6 +140,7 @@ async def _serve_voice(
             await websocket.send_bytes(data)
 
     logger.info(f"voice client connected: {client_id!r} ({name})")
+    voice_hub.register(client_id, speak=None, reply=None)  # filled below
     await send_json({"type": "ready", "client_id": client_id, "name": name})
 
     segmenter = VadSegmenter(
@@ -101,8 +150,66 @@ async def _serve_voice(
         hangover_ms=700,
         max_speech_ms=config.VOICE_MAX_SECONDS * 1000,
     )
+    async def speak(text: str) -> None:
+        """Озвучить текст в этот сокет. Пустой текст — просто тишина.
+
+        Используется и обычным ходом, и фоновыми ходами через ``VoiceHub``.
+        """
+        speech = sanitize_for_tts(text or "")
+        if not speech:
+            return
+
+        await send_json({"type": "status", "status": "tts"})
+        bytes_sent = 0
+        pieces_seen = 0
+
+        def on_tts_status(info: dict[str, Any]) -> None:
+            """Логируем каждый готовый кусок Google TTS."""
+            nonlocal pieces_seen
+            pieces_seen = int(info["total"])
+            logger.info(
+                f"voice {client_id}: google TTS piece "
+                f"{info['index'] + 1}/{info['total']} "
+                f"({len(info['text'])} chars, mp3={info['mp3_bytes']}B, "
+                f"pcm={info['pcm_bytes']}B, {info['elapsed_s']}s)"
+            )
+
+        try:
+            if tts_backend == "google":
+                # Куски уходят в сокет сразу по готовности; следующий
+                # кусок качается, пока играется текущий.
+                async for chunk in stream_google_pcm(
+                    speech, on_status=on_tts_status
+                ):
+                    bytes_sent += len(chunk)
+                    await send_bytes(chunk)
+            else:
+                async for chunk in stream_pcm(
+                    speech,
+                    output_format=config.VOICE_TTS_FORMAT,
+                    optimize_streaming_latency=config.VOICE_TTS_LATENCY,
+                ):
+                    bytes_sent += len(chunk)
+                    await send_bytes(chunk)
+        except Exception as exc:
+            logger.exception(
+                f"voice TTS streaming failed (backend={tts_backend}) for {client_id}: {exc}"
+            )
+            await send_json({"type": "error", "message": "voice TTS failed"})
+            return
+
+        logger.info(
+            f"voice {client_id}: answer {len(text or '')} chars, "
+            f"TTS backend={tts_backend}, "
+            f"pieces={pieces_seen if tts_backend == 'google' else 1}, "
+            f"{bytes_sent} bytes PCM"
+        )
+
     session_open = False
     accept_audio = False
+
+
+    voice_hub.register(client_id, speak=speak, reply=None)
     turn_task: asyncio.Task | None = None
 
     async def run_turn(pcm: bytes) -> None:
@@ -187,59 +294,7 @@ async def _serve_voice(
 
             answer = (answer or "").strip()
             await send_json({"type": "final", "text": answer})
-            speech = sanitize_for_tts(answer)
-            if not speech:
-                await send_json(
-                    {"type": "done", "elapsed": time.time() - started}
-                )
-                return
-
-            await send_json({"type": "status", "status": "tts"})
-            bytes_sent = 0
-            pieces_seen = 0
-
-            def on_tts_status(info: dict[str, Any]) -> None:
-                """Логируем каждый готовый кусок Google TTS."""
-                nonlocal pieces_seen
-                pieces_seen = int(info["total"])
-                logger.info(
-                    f"voice {client_id}: google TTS piece "
-                    f"{info['index'] + 1}/{info['total']} "
-                    f"({len(info['text'])} chars, mp3={info['mp3_bytes']}B, "
-                    f"pcm={info['pcm_bytes']}B, {info['elapsed_s']}s)"
-                )
-
-            try:
-                if tts_backend == "google":
-                    # Куски уходят в сокет сразу по готовности; следующий
-                    # кусок качается, пока играется текущий.
-                    async for chunk in stream_google_pcm(
-                        speech, on_status=on_tts_status
-                    ):
-                        bytes_sent += len(chunk)
-                        await send_bytes(chunk)
-                else:
-                    async for chunk in stream_pcm(
-                        speech,
-                        output_format=config.VOICE_TTS_FORMAT,
-                        optimize_streaming_latency=config.VOICE_TTS_LATENCY,
-                    ):
-                        bytes_sent += len(chunk)
-                        await send_bytes(chunk)
-            except Exception as exc:
-                logger.exception(
-                    f"voice TTS streaming failed (backend={tts_backend})"
-                )
-                await send_json(
-                    {"type": "error", "message": f"TTS error: {exc}"}
-                )
-
-            logger.info(
-                f"voice {client_id}: answer {len(answer)} chars, "
-                f"TTS backend={tts_backend}, "
-                f"pieces={pieces_seen if tts_backend == 'google' else 1}, "
-                f"{bytes_sent} bytes PCM"
-            )
+            await speak(answer)
             await send_json(
                 {"type": "done", "elapsed": time.time() - started}
             )
@@ -327,6 +382,7 @@ async def _serve_voice(
     except Exception:
         logger.exception(f"voice socket failed for {client_id}")
     finally:
+        voice_hub.unregister(client_id)
         if turn_task is not None and not turn_task.done():
             turn_task.cancel()
             with suppress(asyncio.CancelledError):
