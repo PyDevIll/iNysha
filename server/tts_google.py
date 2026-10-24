@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -32,6 +33,12 @@ from loguru import logger
 DEFAULT_LIMIT = 180
 
 GOOGLE_TTS_URL = "https://translate.google.com/translate_tts"
+
+# Скорость чтения Google TTS. Замерено 24.10.2026: ttsspeed=0.24 даёт обычный
+# темп ~4.3 слова/сек, 1.0 и 1.5 - тот же самый (параметр сервисом
+# игнорируется). Ускорить Google Translate TTS нельзя; реальный способ -
+# сжимать время PCM на нашей стороне (atempo через ffmpeg).
+GOOGLE_TTS_SPEED = "1.0"
 
 # Без этих заголовков Google отвечает 403 Forbidden.
 GOOGLE_HEADERS = {
@@ -129,6 +136,7 @@ async def synth_piece(text: str) -> bytes:
         "q": text,
         "tl": "ru",
         "client": "tw-ob",
+        **({"ttsspeed": GOOGLE_TTS_SPEED} if GOOGLE_TTS_SPEED not in ("", "1.0") else {}),
         "total": "1",
         "idx": "0",
         "textlen": str(len(text)),
