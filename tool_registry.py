@@ -27,6 +27,23 @@ class ToolDef:
 # Tools exposed to the model only inside a voice turn (see get_openai_tools).
 VOICE_ONLY_TOOLS = frozenset({"start_tool", "check_tool", "list_tool_tasks"})
 
+# Медленные инструменты: сеть, внешние API, распознавание картинок.
+# В голосовом ходе они не показываются модели напрямую — только через start_tool
+# (fire-and-forget), иначе ответ ждёт 3-10 секунд и разговор рассыпается.
+# В текстовых сессиях (MAX, desktop) доступны как обычно.
+VOICE_DEFERRED_TOOLS = frozenset({
+    "rest_api_call",
+    "tavily_search",
+    "tavily_browse",
+    "tavily_map",
+    "tavily_research",
+    "get_screenshot",
+    "analyze_dynamic_scene",
+    "vision_analyze",
+    "vision_analyze_url",
+    "aider_run",
+})
+
 
 class ToolRegistry:
     """Async-first tool registry with hot-reload via importlib."""
@@ -104,13 +121,17 @@ class ToolRegistry:
 
         ``voice_mode=True`` additionally exposes the fire-and-forget tools
         (start_tool / check_tool / list_tool_tasks) that make the agent
-        responsive during a spoken turn. In text sessions they are hidden so
-        the model never knows they exist.
+        responsive during a spoken turn, and hides the slow network/vision
+        tools (VOICE_DEFERRED_TOOLS) — those are reachable only through
+        start_tool. In text sessions they are hidden so the model never knows
+        they exist.
         """
         tools = []
         names = []
         for tdef in self._tools.values():
             if tdef.name in VOICE_ONLY_TOOLS and not voice_mode:
+                continue
+            if voice_mode and tdef.name in VOICE_DEFERRED_TOOLS:
                 continue
             names.append(tdef.name)
             tools.append({
