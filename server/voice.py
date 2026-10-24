@@ -60,7 +60,7 @@ class VoiceHub:
         self._sessions[client_id] = {
             "speak": speak,
             "reply": reply,
-            "lock": asyncio.Lock(),
+            "playback": asyncio.Lock(),
             "since": time.time(),
         }
         logger.info(f"voice hub: session {client_id} registered")
@@ -84,29 +84,42 @@ class VoiceHub:
         if not (text or "").strip():
             logger.info(f"voice hub: {client_id} stays silent (empty answer)")
             return False
-        # Пока играет предыдущая фраза, новый текст ждёт в очереди, чтобы
-        # фоновый ответ не наехал на реплику живого хода.
-        async with session["lock"]:
-            try:
-                await session["speak"](text)
-                return True
-            except Exception as exc:
-                logger.warning(f"voice hub: speak failed for {client_id}: {exc}")
-                return False
+        # Новый текст ждёт, пока договорит предыдущий: две озвучки в один
+        # сокет одновременно = каша в ушах пользователя.
+        async with session["playback"]:
+            started = time.time()
+            ok = await speak_safe(session, text)
+            logger.info(
+                f"voice hub: {client_id} spoken, {time.time() - started:.1f}s playback"
+            )
+            return ok
 
     async def wait_idle(self, client_id: str, timeout: float = 30.0) -> None:
-        """Подождать, пока в сессии замолчат. Используется фоновыми ходами."""
+        """Дождаться, пока закончится текущая озвучка (максимум ``timeout``)."""
         session = self._sessions.get(client_id)
         if session is None:
             return
-        lock = session["lock"]
-        if lock.locked():
-            logger.info(f"voice hub: {client_id} is speaking, waiting to talk")
+        playback = session["playback"]
+        if not playback.locked():
+            # сессия свободна: подождать нечего, задержки не добавляем
+            return
+        logger.info(f"voice hub: {client_id} is speaking, background turn waits")
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=timeout)
-            lock.release()
-        except asyncio.TimeoutError:
+            async with asyncio.timeout(timeout):
+                async with playback:
+                    pass
+        except (asyncio.TimeoutError, TimeoutError):
             logger.info(f"voice hub: {client_id} still busy after {timeout}s")
+
+
+async def speak_safe(session: dict[str, Any], text: str) -> bool:
+    """Озвучить текст; ошибка синтеза не должна ронять сессию."""
+    try:
+        await session["speak"](text)
+        return True
+    except Exception as exc:
+        logger.warning(f"voice hub: speak failed: {exc}")
+        return False
 
 
 voice_hub = VoiceHub()

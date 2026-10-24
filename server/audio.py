@@ -86,8 +86,19 @@ def content_type_for(filename: str) -> str:
     return _CONTENT_TYPES.get(Path(filename).suffix.lower(), "application/octet-stream")
 
 
+_TIME_PREFIX_RE = re.compile(
+    r"^\s*(?:\[Time:[^\]]*\]\s*)+", re.IGNORECASE
+)
+
+
 def sanitize_for_tts(text: str) -> str:
-    """Strip markdown/emoji so the text reads well through TTS."""
+    """Strip markdown/emoji so the text reads well through TTS.
+
+    Служебную метку ``[Time: ДД.ММ.ГГГГ, ЧЧ:ММ]``, которую контекст-менеджер
+    приклеивает к каждой реплике, вырезаем ДО чистки символов: иначе точки и
+    двоеточия выживают и синтез зачитывает дату вслух.
+    """
+    text = _TIME_PREFIX_RE.sub("", text or "")
     allowed = r"[^a-zA-Zа-яА-ЯёЁ0-9\s\.\,\!\?\;\:\'\-\–\—]"
     cleaned = re.sub(allowed, " ", text)
     return re.sub(r"\s+", " ", cleaned).strip()
