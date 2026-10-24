@@ -102,8 +102,23 @@ async def worker_loop(rt: "Runtime") -> None:
                 async def reasoning_callback(thought: str) -> None:  # noqa: F811
                     await rt.bot.send_reasoning(thought)
 
+            agent_input = req.text
+            if req.tool_result is not None:
+                agent_input = (
+                    f"[ФОНОВЫЙ РЕЗУЛЬТАТ] Инструмент «{req.tool_name}» завершился, "
+                    f"пока ты говорила с пользователем.\n"
+                    f"Это данные, которые ты запрашивала — используй их как контекст "
+                    f"и при необходимости скажи о находке в одной-двух фразах. "
+                    f"Не зачитывай сырой текст целиком.\n\n"
+                    f"{req.tool_result}"
+                )
+                logger.info(
+                    f"[{req.id}] tool_result turn for '{req.tool_name}' "
+                    f"({len(str(req.tool_result))} chars)"
+                )
+
             response = await rt.agent.run_with_crash_recovery(
-                initial_user_request=req.text,
+                initial_user_request=agent_input,
                 reasoning_callback=reasoning_callback,
             )
             elapsed = time.time() - started

@@ -98,6 +98,21 @@ def validate_message_sequence(messages: list[dict]) -> None:
         )
 
 
+TOOL_OUTPUT_LIMIT = 2000   # chars kept from a single tool result
+
+
+def _limit_tool_output(result, limit: int = TOOL_OUTPUT_LIMIT) -> str:
+    """Bound how much of a tool result enters the context."""
+    text = "" if result is None else str(result)
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit]
+        + f"\n\n[... truncated: shown first {limit} of {len(text)} chars — "
+          f"narrow the request or fetch the rest if needed]"
+    )
+
+
 class Agent:
     """Async reasoning agent with hot-reload tools, crash recovery, and layered context."""
 
@@ -185,7 +200,7 @@ class Agent:
             "tool_call_id": tool_call.id,
             "role": "tool",
             "name": func_name,
-            "content": result,
+            "content": _limit_tool_output(result),
         }
 
     async def _execute_tools_parallel(self, tool_calls, user_request: str = "") -> list[dict]:

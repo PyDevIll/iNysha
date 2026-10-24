@@ -244,6 +244,23 @@ import time
 import uuid as _uuid
 from typing import Any as _Any, Dict as _Dict
 
+RESULT_CHAR_LIMIT = 2000      # keep tool output (and context) bounded
+
+
+def _truncate_result(text: str, limit: int = RESULT_CHAR_LIMIT) -> str:
+    """Cut a tool result to ``limit`` chars with an explicit tail marker."""
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit]
+        + f"\n\n[... truncated: shown first {limit} of {len(text)} chars; "
+          f"narrow the query or ask for the rest if needed]"
+    )
+
+
 _TOOL_TASKS: _Dict[str, dict] = {}
 _TASKS_TTL = 3600.0          # forget finished tasks after an hour
 _MAX_FINISHED = 200          # hard cap on remembered finished tasks
@@ -274,8 +291,59 @@ def _describe_task(tid: str, t: dict, with_result: bool = False) -> str:
     return head
 
 
+async def _deliver_tool_result(task: dict, tid: str) -> None:
+    """Push a finished background result into the agent queue as its own turn.
+
+    The model MUST see every tool result, so instead of relying on the model
+    to call ``check_tool`` we enqueue a ``Request(source="tool_result")``.
+    The worker picks it up automatically and the result lands in the context
+    of a fresh turn, keeping the OpenAI tool_call/tool pairing intact.
+    """
+    try:
+        from server.runtime import runtime as rt
+    except Exception as e:
+        logger.warning(f"cannot enqueue tool result {tid}: {e}")
+        return
+    if rt is None or getattr(rt, "queue", None) is None:
+        return
+
+    from server.queue import Request
+    from server.routing import NullReply, MaxReply
+
+    chat_id = task.get("chat_id")
+    client_id = task.get("client_id")
+    reply = NullReply()
+    # Voice turns have no reply target of their own: the spoken answer is
+    # streamed by the voice pipeline, so a background turn only writes to
+    # the context and stays silent. MAX chats get a real reply.
+    if chat_id and getattr(rt, "bot", None) is not None:
+        try:
+            reply = MaxReply(rt.bot, chat_id)
+        except Exception:
+            reply = NullReply()
+    _ = client_id  # voice results are delivered into context only
+
+    payload = task.get("result") if task["status"] == "ready" else task.get("error")
+    req = Request(
+        text=f"[Фоновый результат инструмента {task['tool']}]",
+        source="tool_result",
+        chat_id=chat_id,
+        client_id=client_id,
+        trusted=True,
+        tool_result=str(payload),
+        tool_task_id=tid,
+        tool_name=task["tool"],
+        reply=reply,
+    )
+    await rt.queue.put(req)
+    logger.info(
+        f"tool task {tid} ({task['tool']}) -> queue as request {req.id} "
+        f"(status={task['status']}, queue left={rt.queue.qsize()})"
+    )
+
+
 async def _run_tool_task(tid: str, tool: str, kwargs: dict) -> None:
-    """Background runner: executes the tool and stores its outcome."""
+    """Background runner: executes the tool, stores and delivers its outcome."""
     from tool_registry import get_registry
     task = _TOOL_TASKS.get(tid)
     if task is None:
@@ -283,7 +351,7 @@ async def _run_tool_task(tid: str, tool: str, kwargs: dict) -> None:
     try:
         registry = get_registry()
         result = await registry.call_tool(tool, **kwargs)
-        raw = str(result)
+        raw = _truncate_result(str(result))
         task["status"] = "failed" if raw.startswith("Error") else "ready"
         task["result"] = raw
         if raw.startswith("Error"):
@@ -295,6 +363,8 @@ async def _run_tool_task(tid: str, tool: str, kwargs: dict) -> None:
     finally:
         task["finished_at"] = time.time()
         _prune_tasks()
+        if task.get("auto_deliver", True):
+            await _deliver_tool_result(task, tid)
 
 
 async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0) -> str:
@@ -331,6 +401,11 @@ async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0)
         "result": None,
         "error": None,
         "started_at": time.time(),
+        # where the finished result should be delivered
+        "chat_id": getattr(ctx, "chat_id", None),
+        "client_id": getattr(ctx, "client_id", None),
+        "source": getattr(ctx, "source", None),
+        "auto_deliver": True,
     }
     asyncio.create_task(_run_tool_task(tid, tool, kwargs))
     logger.info(f"start_tool: {tool}({json.dumps(kwargs, ensure_ascii=False)[:120]}) -> task {tid}")
@@ -338,7 +413,7 @@ async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0)
             f"Не говори, что результат уже есть. Скажи, что проверяешь, и забери результат через check_tool('{tid}').")
 
 
-async def check_tool(task_id: str, wait_seconds: float = 0, consume: bool = True) -> str:
+async def check_tool(task_id: str, wait_seconds: float = 0, consume: bool = False) -> str:
     """Check a fire-and-forget task: running / ready / failed, with the result when ready."""
     tid = (task_id or "").strip()
     task = _TOOL_TASKS.get(tid)
@@ -432,7 +507,7 @@ TOOL_DEFINITIONS = [
         "properties": {
             "task_id": {"type": "string", "description": "Task id returned by start_tool"},
             "wait_seconds": {"type": "number", "description": "How long to wait for completion before returning (default: 0 — instant peek, max 30)"},
-            "consume": {"type": "boolean", "description": "Remove the task after reading a ready result (default: true)"},
+            "consume": {"type": "boolean", "description": "Remove the task after reading a ready result (default: false — the result is also delivered to the queue automatically)"},
         },
         "required": ["task_id"],
     }),

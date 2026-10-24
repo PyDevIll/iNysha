@@ -20,6 +20,12 @@ class Request:
     client_id: str | None = None
     trusted: bool = False
     send_reasoning: bool = False
+    # Set for background tool results delivered as a separate agent turn.
+    # ``tool_result`` holds the already-formatted payload; the agent is asked
+    # to react to it instead of waiting for user input.
+    tool_result: str | None = None
+    tool_task_id: str | None = None
+    tool_name: str | None = None
     reply: ReplyTarget = field(default_factory=NullReply)
     created_at: float = field(default_factory=time.time)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
