@@ -27,6 +27,20 @@ RETRY_INTERVAL = 5  # seconds
 LONG_POLL_TIMEOUT = 30  # seconds
 
 
+def sent_message(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract ``message`` from a ``POST /messages`` response, or ``{}``."""
+    if not isinstance(response, dict) or response.get("ok") is False:
+        return {}
+    return response.get("message") or {}
+
+
+def delivery_error(response: Dict[str, Any], default: str = "send failed") -> str:
+    """Pull the real failure reason out of a ``POST /messages`` response."""
+    if isinstance(response, dict) and response.get("error"):
+        return str(response["error"])
+    return default
+
+
 def _safe_filename_from_token(token: str, content_type: str = "") -> str:
     """
     Generate a safe filename from a token, avoiding path separators and invalid chars.
@@ -373,6 +387,14 @@ class MAXBotApi:
 
     # ---------- Message API ----------
     async def send_message_to_chat(self, chat_id: int, text: str, extra: Optional[Dict] = None) -> Dict:
+        """POST /messages to a chat.
+
+        Returns the raw API response: ``{"message": {...}}`` on success,
+        ``{"ok": False, "error": "..."}`` on transport/API failure.  Errors are
+        deliberately not swallowed — callers must see *why* a send failed
+        (timeout, 403 chat.denied, …) or the agent cannot tell a broken
+        transport from a broken message and retries forever.
+        """
         body = {"text": text}
         if extra:
             body.update(extra)
@@ -384,7 +406,7 @@ class MAXBotApi:
             body=body,
         )
         logger.debug(f"[send_message_to_chat] result={result}")
-        return result.get("message", {})
+        return result
 
     async def send_message_to_user(self, user_id: int, text: str, extra: Optional[Dict] = None) -> Dict:
         body = {"text": text}
@@ -396,7 +418,7 @@ class MAXBotApi:
             query={"user_id": user_id},
             body=body,
         )
-        return result.get("message", {})
+        return result
 
 
     async def get_messages(
@@ -622,7 +644,11 @@ class MAXBot:
             chat_id = params.get("chat_id")
             text = params.get("text", "")
             if chat_id:
-                return await self._api.send_message_to_chat(chat_id, text)
+                result = await self._api.send_message_to_chat(chat_id, text)
+                message = sent_message(result)
+                if message:
+                    return {"ok": True, "result": message}
+                return {"ok": False, "error": delivery_error(result)}
             return {"ok": False, "error": "chat_id required"}
 
         if method == "getUpdates":
@@ -644,10 +670,14 @@ class MAXBot:
             text,
             {"format": "markdown"},
         )
-        if not result:
-            # Retry without markdown if failed (should not happen)
+        message = sent_message(result)
+        if not message and not delivery_error(result, ""):
+            # API answered but returned no message — retry without markdown once.
             result = await self._api.send_message_to_chat(chat_id, text)
-        return {"ok": True, "result": result} if result else {"ok": False, "error": "send failed"}
+            message = sent_message(result)
+        if message:
+            return {"ok": True, "result": message}
+        return {"ok": False, "error": delivery_error(result)}
 
     async def send_reasoning(self, text: str) -> None:
         """Send reasoning thought to the dedicated reasoning chat."""
@@ -690,7 +720,10 @@ class MAXBot:
         logger.debug(f"[send_document] chat_id={chat_id} caption={caption!r} text_param={text_param!r} extra={extra}")
         result = await self._api.send_message_to_chat(chat_id, text_param, extra)
         logger.debug(f"[send_document] send_message_to_chat result={result}")
-        return {"ok": True, "result": result} if result else {"ok": False, "error": "send failed"}
+        message = sent_message(result)
+        if message:
+            return {"ok": True, "result": message}
+        return {"ok": False, "error": delivery_error(result)}
 
 
     async def send_voice(self, chat_id: int, voice_path: str, caption: Optional[str] = None,
@@ -727,7 +760,10 @@ class MAXBot:
         logger.debug(f"[send_voice] chat_id={chat_id} caption={caption!r} text_param={text_param!r} extra={extra}")
         result = await self._api.send_message_to_chat(chat_id, text_param, extra)
         logger.debug(f"[send_voice] send_message_to_chat result={result}")
-        return {"ok": True, "result": result} if result else {"ok": False, "error": "send failed"}
+        message = sent_message(result)
+        if message:
+            return {"ok": True, "result": message}
+        return {"ok": False, "error": delivery_error(result)}
 
 
     async def download_file(

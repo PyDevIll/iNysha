@@ -223,13 +223,22 @@ class Runtime:
         registry.set_bot(self.bot)
 
         try:
-            info = await self.bot._api.get_my_info()
+            # MAX API outage must not block startup: uvicorn binds the port only
+            # after this coroutine returns, so an unreachable platform-api2
+            # would keep the whole instance deaf to webhooks for the full
+            # httpx timeout (~70s).
+            info = await asyncio.wait_for(self.bot._api.get_my_info(), timeout=5.0)
             if info.get("user_id"):
                 self.max_username = info.get("username") or info.get("name")
                 self.max_user_id = info.get("user_id")
                 logger.info(f"MAX bot online: @{self.max_username} ({self.max_user_id})")
             else:
                 logger.warning(f"MAX bot identity check failed: {info}")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MAX bot identity check timed out (5s) — MAX API unreachable, "
+                "starting without it"
+            )
         except Exception:
             logger.exception("MAX bot identity check failed")
 

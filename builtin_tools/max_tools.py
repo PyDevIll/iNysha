@@ -18,6 +18,27 @@ from typing import Any, Optional
 from loguru import logger
 
 from lib.elevenlabs_tts import synthesize_to_file
+from lib.max_bot import delivery_error, sent_message
+
+
+#: Транспортная ошибка MAX API — повтор в том же ходе бессмысленен и только
+#: блокирует очередь запросов. Текст попадает в tool-результат, который видит
+#: модель, поэтому формулировка — прямое указание, что делать.
+_DELIVERY_HINT = (
+    "Отправка не удалась на уровне транспорта MAX API (таймаут/сеть/блокировка). "
+    "Это не проблема текста: переформулировка и повторная отправка в этом же ходе "
+    "не помогут и только держат очередь. Не повторяй вызов."
+)
+
+
+def _delivery_failure(reason: Optional[str]) -> dict[str, Any]:
+    """Единый вид ошибки доставки для всех MAX-инструментов."""
+    return {
+        "ok": False,
+        "error": reason or "send failed",
+        "retry_same_turn": False,
+        "hint": _DELIVERY_HINT,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -56,7 +77,11 @@ async def max_send_file(
 
     logger.info(f"MAX tool: sending file {path} to chat_id={chat_id}")
     result = await bot.send_document(int(chat_id), str(path), caption=caption)
-    return result
+    if result.get("ok"):
+        return result
+    reason = delivery_error(result, "document send failed")
+    logger.warning(f"MAX tool: send file to chat_id={chat_id} failed: {reason}")
+    return _delivery_failure(reason)
 
 
 async def max_download_file(
@@ -145,7 +170,7 @@ async def max_send_voice(
         )
     except Exception as exc:
         logger.exception("MAX voice send failed")
-        return {"ok": False, "error": str(exc)}
+        return _delivery_failure(str(exc))
     finally:
         with suppress(OSError):
             audio_path.unlink(missing_ok=True)
@@ -156,8 +181,11 @@ async def max_send_voice(
             f"({tts_result.get('voice_id')}): {text[:50]!r}..."
         )
         _mark_chat_replied(chat_id)
+        return send_result
 
-    return send_result
+    reason = delivery_error(send_result, "voice send failed")
+    logger.warning(f"MAX tool: send voice to chat_id={chat_id} failed: {reason}")
+    return _delivery_failure(reason)
 
 
 # ----------------------------------------------------------------------
@@ -198,11 +226,13 @@ async def max_send_message(
 
     logger.info(f"MAX tool: sending message to chat_id={chat_id}: {text[:50]}...")
     result = await bot._api.send_message_to_chat(int(chat_id), text, extra)
-    if result:
+    message = sent_message(result)
+    if message:
         _mark_chat_replied(chat_id)
-        return {"ok": True, "result": result}
-    else:
-        return {"ok": False, "error": "send failed"}
+        return {"ok": True, "result": message}
+    reason = delivery_error(result)
+    logger.warning(f"MAX tool: send to chat_id={chat_id} failed: {reason}")
+    return _delivery_failure(reason)
 
 
 async def max_get_messages(

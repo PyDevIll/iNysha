@@ -57,7 +57,12 @@ class MaxReply:
                 f"MAX chat {self.chat_id} already answered by a tool; skipping final send"
             )
             return
-        await self.bot.send_message(int(self.chat_id), text)
+        result = await self.bot.send_message(int(self.chat_id), text)
+        if isinstance(result, dict) and not result.get("ok"):
+            logger.error(
+                f"MAX final reply to chat {self.chat_id} not delivered: "
+                f"{result.get('error') or 'unknown error'}"
+            )
 
     async def send_error(self, text: str) -> None:
         await self.send_text(f"⚠️ {text}")

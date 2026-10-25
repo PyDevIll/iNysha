@@ -101,7 +101,7 @@ Routing rules:
 
 | Tool | Rating | Notes |
 |------|--------|-------|
-| `rest_api_call` | ★★★★★ | **Universal REST client.** Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS. Features: query parameters, headers, JSON/form/multipart bodies, authentication (Basic/Bearer), cookies, SSL verification, timeout. ⚠️ **SOCKS5 proxy (`socks5://127.0.0.1:1080`) is NOT running** — do not use. Direct connection works for MAX API and Google TTS. |
+| `rest_api_call` | ★★★★★ | **Universal REST client.** Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS. Features: query parameters, headers, JSON/form/multipart bodies, authentication (Basic/Bearer), cookies, SSL verification, timeout. Direct connection works for MAX API and Google TTS. |
 
 ---
 
