@@ -84,7 +84,7 @@ def _reset_state() -> None:
 def _check_secret(request: HttpRequest) -> None:
     if not config.MAX_WEBHOOK_SECRET:
         return
-    provided = request.headers.get("x-inysha-secret")
+    provided = request.headers.get(config.SECRET_HEADER)
     if provided != config.MAX_WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="invalid webhook secret")
 
@@ -108,8 +108,7 @@ def _is_new(key: str) -> bool:
     return True
 
 
-@router.post("/inysha/max-webhook")
-@router.post("/max-webhook")
+@router.post(config.MAX_WEBHOOK_PATH)
 async def max_webhook(request: HttpRequest):
     """Receive a MAX update forwarded by the Yandex Cloud Function."""
     _check_secret(request)
@@ -134,6 +133,19 @@ async def max_webhook(request: HttpRequest):
     _background.add(task)
     task.add_done_callback(_background.discard)
     return {"ok": True}
+
+
+if (
+    config.MAX_WEBHOOK_ALIAS_PATH
+    and config.MAX_WEBHOOK_ALIAS_PATH != config.MAX_WEBHOOK_PATH
+):
+    router.add_api_route(
+        config.MAX_WEBHOOK_ALIAS_PATH,
+        max_webhook,
+        methods=["POST"],
+        include_in_schema=False,
+        name="max_webhook_alias",
+    )
 
 
 async def handle_update(update: dict[str, Any]) -> bool:

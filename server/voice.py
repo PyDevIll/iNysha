@@ -636,8 +636,8 @@ async def voice_ws(websocket: WebSocket) -> None:
     """Desktop clients: mandatory HELLO with CLIENT_TOKEN."""
     await websocket.accept()
 
-    # The /inysha/voice/ Vite page uses this route with ?dev=1 and cannot
-    # send HELLO, so it runs in browser mode without a token. ?dev=1 keeps
+    # The browser Vite page uses this route with ?dev=1 and cannot send
+    # HELLO, so it runs in browser mode without a token. ?dev=1 keeps
     # the ElevenLabs comparison backend; otherwise Google TTS is used.
     if websocket.query_params.get("dev") == "1":
         await _serve_voice(

@@ -28,6 +28,10 @@ import urllib.request
 
 FORWARD_URL = os.environ.get("FORWARD_URL", "").strip()
 SECRET = os.environ.get("MAX_WEBHOOK_SECRET", "")
+FORWARD_SECRET_HEADER = (
+    os.environ.get("FORWARD_SECRET_HEADER", "").strip()
+    or "X-Inysha-Secret"
+)
 DEBUG_PING_URL = os.environ.get("DEBUG_PING_URL", "").strip()
 
 
@@ -83,7 +87,7 @@ def handler(event, context):
         data=body.encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "X-Inysha-Secret": SECRET,
+            FORWARD_SECRET_HEADER: SECRET,
         },
         method="POST",
     )
@@ -104,15 +108,17 @@ def handler(event, context):
 
 | Variable | Value |
 |---|---|
-| `FORWARD_URL` | `http://2.24.160.163:8010/inysha/max-webhook` |
-| `MAX_WEBHOOK_SECRET` | the exact value of `MAX_WEBHOOK_SECRET` from `~/iNysha/.env` |
-| `DEBUG_PING_URL` | `http://2.24.160.163:8010/api/function-ping` (optional, for testing) |
+| `FORWARD_URL` | the server's `MAX_WEBHOOK_PATH`, e.g. `http://2.24.160.163:8010/inysha/max-webhook` |
+| `MAX_WEBHOOK_SECRET` | the exact value of `MAX_WEBHOOK_SECRET` from the server's `.env` |
+| `FORWARD_SECRET_HEADER` | must match `SECRET_HEADER` in the server's `.env` (default `X-Inysha-Secret`) |
+| `DEBUG_PING_URL` | the server's `/api/function-ping` (optional, for testing) |
 
 `MAX_BOT_TOKEN` is **not needed** by the function.
 
 The webhook subscription secret is the same `MAX_WEBHOOK_SECRET` value. MAX
 sends it in `X-Max-Bot-Api-Secret`; the function checks it and forwards the
-same value in `X-Inysha-Secret`, which the VDS accepts.
+same value in `FORWARD_SECRET_HEADER`, which must match the server's
+`SECRET_HEADER`.
 
 ## VDS prerequisites
 
@@ -123,7 +129,7 @@ same value in `X-Inysha-Secret`, which the VDS accepts.
   .venv/bin/uvicorn server.main:app --host 0.0.0.0 --port 8010 --log-level debug
   ```
 
-- The FastAPI app exposes both `/max-webhook` and `/inysha/max-webhook`.
+- The FastAPI app exposes `MAX_WEBHOOK_PATH` (derived from `INSTANCE_SLUG`, default `/inysha/max-webhook`) and the optional `MAX_WEBHOOK_ALIAS_PATH` (default `/max-webhook`).
 - Port 8010 must be reachable from the internet (firewall/security group).
 - `MAX_TRANSPORT=webhook` in `~/iNysha/.env`.
 - Nginx/TLS is not used for this path.

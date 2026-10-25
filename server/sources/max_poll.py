@@ -15,7 +15,7 @@ from loguru import logger
 from server import config
 from server.sources.max import handle_update
 
-MARKER_FILE = config.DATA_DIR / "max_marker.json"
+MARKER_FILE = config.MAX_MARKER_FILE
 
 
 def _load_marker() -> int | None:
@@ -32,7 +32,7 @@ def _save_marker(marker: int | None) -> None:
     if marker is None:
         return
     try:
-        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
         MARKER_FILE.write_text(
             json.dumps({"marker": marker}), encoding="utf-8"
         )

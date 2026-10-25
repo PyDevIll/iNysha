@@ -253,7 +253,7 @@ async def client_ws(websocket: WebSocket) -> None:
             "type": "welcome",
             "client_id": info.client_id,
             "name": info.name,
-            "server": "inysha",
+            "server": config.INSTANCE_SLUG,
         }
     )
 

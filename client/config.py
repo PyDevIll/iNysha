@@ -29,15 +29,22 @@ def _device(value: str | None):
     return int(value) if value.isdigit() else value
 
 
+SERVER_PATH_PREFIX = os.getenv(
+    "SERVER_PATH_PREFIX", os.getenv("INSTANCE_SLUG", "inysha")
+).strip("/")
+DEFAULT_SERVER_URL = f"ws://127.0.0.1:{os.getenv('SERVER_PORT', '8010')}"
+
+
 def _flat_ws_url(raw: str) -> str:
-    url = (raw or "ws://127.0.0.1:8010").strip().rstrip("/")
+    url = (raw or DEFAULT_SERVER_URL).strip().rstrip("/")
     if url.startswith("https://"):
         url = "wss://" + url[len("https://") :]
     elif url.startswith("http://"):
         url = "ws://" + url[len("http://") :]
     # Be forgiving of the old nginx-style prefix from the first design.
-    if url.endswith("/inysha"):
-        url = url[: -len("/inysha")]
+    # Set SERVER_PATH_PREFIX (e.g. "delirya") for another instance path.
+    if SERVER_PATH_PREFIX and url.endswith("/" + SERVER_PATH_PREFIX):
+        url = url[: -len("/" + SERVER_PATH_PREFIX)]
     return url
 
 
@@ -47,6 +54,7 @@ class ClientConfig:
     token: str
     client_id: str
     name: str
+    app_name: str
     hotkey: str
     sample_rate: int
     frame_ms: int
@@ -64,10 +72,17 @@ class ClientConfig:
         )
         client_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_id).strip("-")[:64]
         return cls(
-            server_url=_flat_ws_url(os.getenv("SERVER_URL", "ws://127.0.0.1:8010")),
+            server_url=_flat_ws_url(
+                os.getenv("SERVER_URL", DEFAULT_SERVER_URL)
+            ),
             token=os.getenv("CLIENT_TOKEN", ""),
             client_id=client_id or f"client-{os.getpid()}",
             name=os.getenv("CLIENT_NAME") or host,
+            app_name=(
+                os.getenv("CLIENT_APP_NAME")
+                or os.getenv("INSTANCE_NAME")
+                or "iNysha"
+            ),
             hotkey=os.getenv("CLIENT_HOTKEY", "<f8>"),
             sample_rate=int(os.getenv("VOICE_SAMPLE_RATE", "16000")),
             frame_ms=int(os.getenv("CLIENT_FRAME_MS", "30")),

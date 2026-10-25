@@ -3,13 +3,14 @@
 Deploy as a Python 3.11/3.12 function with entrypoint ``index.handler``.
 
 Environment variables:
-    FORWARD_URL          http://2.24.160.163:8010/inysha/max-webhook
-    MAX_WEBHOOK_SECRET   same value as in ~/iNysha/.env
-    DEBUG_PING_URL       optional: http://2.24.160.163:8010/api/function-ping
+    FORWARD_URL           http://2.24.160.163:8010/inysha/max-webhook
+    MAX_WEBHOOK_SECRET    same value as in the server's .env
+    FORWARD_SECRET_HEADER forwarded secret header (default X-Inysha-Secret)
+    DEBUG_PING_URL        optional: http://2.24.160.163:8010/api/function-ping
 
 MAX sends its subscription secret in ``X-Max-Bot-Api-Secret``.  The function
-validates it and forwards the same value in ``X-Inysha-Secret``, which the
-VDS webhook route requires.
+validates it and forwards the same value in ``FORWARD_SECRET_HEADER``, which
+must match ``SECRET_HEADER`` in the server's config.
 """
 
 from __future__ import annotations
@@ -23,6 +24,10 @@ import urllib.request
 
 FORWARD_URL = os.environ.get("FORWARD_URL", "").strip()
 SECRET = os.environ.get("MAX_WEBHOOK_SECRET", "")
+FORWARD_SECRET_HEADER = (
+    os.environ.get("FORWARD_SECRET_HEADER", "").strip()
+    or "X-Inysha-Secret"
+)
 DEBUG_PING_URL = os.environ.get("DEBUG_PING_URL", "").strip()
 
 
@@ -72,7 +77,7 @@ def handler(event: dict, context: object) -> dict:
         data=body.encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "X-Inysha-Secret": SECRET,
+            FORWARD_SECRET_HEADER: SECRET,
         },
         method="POST",
     )

@@ -173,7 +173,7 @@ class Runtime:
 
         config.ensure_dirs()
         configure_logging()
-        logger.info("iНюша cloud starting...")
+        logger.info(f"{config.INSTANCE_NAME} cloud starting...")
 
         # get_registry() auto-registers builtins exactly once.  Do not call
         # builtin_tools.register_all() again here (it would duplicate logs and
@@ -188,19 +188,25 @@ class Runtime:
         )
 
         self.helper = Agent(
-            name="HELPER",
+            name=config.HELPER_NAME,
             system_prompt=HELPER_PROMPT,
             use_tools=False,
             save_history=False,
-            api_key=os.getenv("DEEPSEEK_API_KEY_HELPER") or None,
+            api_key=config.DEEPSEEK_API_KEY_HELPER or None,
         )
 
         self.agent = Agent(
-            name="DELIRIA",
+            name=config.AGENT_NAME,
             base_prompts=[
-                ("## **IDENTITY**\n", "system_prompts/core.md"),
-                ("\n## **APPLICATION ARCHITECTURE**\n", "system_prompts/extended.md"),
-                ("\n## **Tools Guidelines & Best Practices**\n", "system_prompts/tools_guidelines.md"),
+                ("## **IDENTITY**\n", str(config.CORE_PROMPT_PATH)),
+                (
+                    "\n## **APPLICATION ARCHITECTURE**\n",
+                    str(config.EXTENDED_PROMPT_PATH),
+                ),
+                (
+                    "\n## **Tools Guidelines & Best Practices**\n",
+                    str(config.TOOLS_GUIDELINES_PROMPT_PATH),
+                ),
             ],
             # last_compression.txt загружает ровно один раз сам ContextPool
             # (_seed_from_last_compression -> _compressed_dicts). Через
@@ -227,16 +233,18 @@ class Runtime:
         except Exception:
             logger.exception("MAX bot identity check failed")
 
-        self.worker_task = asyncio.create_task(worker_loop(self), name="inysha-worker")
+        self.worker_task = asyncio.create_task(
+            worker_loop(self), name=f"{config.INSTANCE_SLUG}-worker"
+        )
         self.scheduler_task = asyncio.create_task(
-            scheduler_loop(self), name="inysha-scheduler"
+            scheduler_loop(self), name=f"{config.INSTANCE_SLUG}-scheduler"
         )
 
         if config.MAX_TRANSPORT == "poll":
             from server.sources.max_poll import poll_max_updates
 
             self.poll_task = asyncio.create_task(
-                poll_max_updates(self), name="max-poller"
+                poll_max_updates(self), name=f"{config.INSTANCE_SLUG}-max-poller"
             )
             logger.info("MAX transport: long polling")
         else:
@@ -244,7 +252,7 @@ class Runtime:
 
         self.started = True
         self.started_at = time.time()
-        logger.info("iНюша cloud ready")
+        logger.info(f"{config.INSTANCE_NAME} cloud ready")
 
     async def shutdown(self) -> None:
         if not self.started:
@@ -278,7 +286,7 @@ class Runtime:
                 with suppress(Exception):
                     await agent._client.close()
 
-        logger.info("iНюша cloud stopped")
+        logger.info(f"{config.INSTANCE_NAME} cloud stopped")
 
 
 runtime = Runtime()

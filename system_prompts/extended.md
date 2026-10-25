@@ -2,7 +2,7 @@
 
 ### Project root
 ```
-/home/desktopme/iNysha/
+{{PROJECT_ROOT}}/
 ```
 
 ### Architecture (cloud)
@@ -11,10 +11,11 @@ One shared agent runs on the VDS. Clients connect to it and provide local capabi
 (screen, microphone, speakers). Every source becomes a `server.queue.Request` and is
 processed strictly one at a time, so all interactions share one context.
 
-### Source file map (all paths relative to project root)
+### Source file map (paths relative to project root unless shown as configured absolute paths)
 
 | # | File                                 | Role |
 |---|--------------------------------------|------|
+| * | `server/config.py`                   | **Instance config**: identity, paths, routes, secrets, limits |
 | * | `server/main.py`                     | **Cloud entry point**: FastAPI app, lifespan, `/api/health`, routers |
 | * | `server/runtime.py`                  | Builds the shared agent, MAX bot, queue and worker; startup/shutdown |
 | * | `server/queue.py`                    | `Request` + `RequestQueue` (one turn at a time) |
@@ -33,9 +34,9 @@ processed strictly one at a time, so all interactions share one context.
 | * | `lib/max_bot.py`                     | `MAXBot`: MAX API, file download/upload, reasoning chat |
 | * | `lib/scheduler.py`                   | In-process scheduler with JSON persistence |
 | * | `lib/textio.py`                      | UTF-8/cp1251-safe file read/write and encoding repair |
-| * | `system_prompts/core.md`             | IDENTITY block: agent name, goal, language, environment |
-| * | `system_prompts/tools_guidelines.md` | Available Tools block: guidelines |
-| * | `system_prompts/extended.md`         | **THIS FILE** — CAPABILITIES, RULES, ARCHITECTURE |
+| * | `{{PROMPTS_DIR}}/core.md`             | IDENTITY block: agent name, goal, language, environment |
+| * | `{{PROMPTS_DIR}}/tools_guidelines.md` | Available Tools block: guidelines |
+| * | `{{PROMPTS_DIR}}/extended.md`         | **THIS FILE** — CAPABILITIES, RULES, ARCHITECTURE |
 | * | `builtin_tools/`                     | Hot-reloadable tool modules: fs, edit, git, tavily, max, tts, vision |
 | * | `client/`                            | Desktop client (Ubuntu/Windows): screen, microphone, speakers, hotkey |
 
@@ -149,7 +150,7 @@ ToolRegistry.list_tools()        # Returns a human-readable string
 - **Web**: Tavily search and browse URL for deeper extraction.
 - **Tools**: Hot-reload tool system via `reload_tools`. New tools loaded without restart.
 - **Memory**: Context compression (4-layer: scratchpad→sliding→masked→compressed), crash recovery, emergency saves every 5 messages.
-- **MAX messenger**: Webhook-driven (Yandex Cloud Function -> `/max-webhook`). Each chat's updates are queued; the final answer is delivered automatically to the originating chat. Reasoning can go to a separate chat. File transfer via `max_send_file` (FS→messenger) and `max_download_file` (Messenger→FS). Incoming documents/photos auto-download to `data/downloads/`; voice messages are transcribed with Groq Whisper.
+- **MAX messenger**: Webhook-driven (Yandex Cloud Function -> `{{MAX_WEBHOOK_PATH}}`). Each chat's updates are queued; the final answer is delivered automatically to the originating chat. Reasoning can go to a separate chat. File transfer via `max_send_file` (FS→messenger) and `max_download_file` (Messenger→FS). Incoming documents/photos auto-download to `{{DATA_DIR}}/downloads/`; voice messages are transcribed with Groq Whisper.
 - **Voice**: independent `VoiceSession` per WebSocket for desktop and browser clients; Groq Whisper STT (Russian) and Google TTS / ElevenLabs (PCM 16 kHz); replies route to the originating `session_id`; MAX voice messages in/out.
 - **Git**: Observation of local repository — status, log, diff.
 
@@ -158,7 +159,7 @@ ToolRegistry.list_tools()        # Returns a human-readable string
 - **Use Advanced Edit Tools by default (`fs_aedit` / `fs_edit_blocks` / `fs_apply_patch` / `fs_write_file`)**: These tools use **SEARCH/REPLACE by content** (fuzzy matching), not line numbers. This is critical — `fs_edit` (line-number-based) is brittle because every edit shifts line numbers, causing subsequent edits to target wrong locations. `fs_aedit` and `fs_edit_blocks` match content, so they work regardless of prior edits. Avoid `fs_edit`/`fs_append` entirely unless the change is a trivial single-line append. This knowledge was empirically learned after multiple duplicate-heading bugs caused by cascading line-number shifts.
 - **Error handling**: Tools return error strings, never crash the agent.
 - **DeepSeek cache**: Keep system prompt + tools static for prefix caching.
-- **Self-learning**: After every significant interaction, consider whether something was learned about the system's overall functioning that should be persisted in this file. Update `data\persistent_memory.json` proactively with learned lessons, new operational knowledge, discovered capabilities, or refined rules.
+- **Self-learning**: After every significant interaction, consider whether something was learned about the system's overall functioning that should be persisted in this file. Update `{{DATA_DIR}}/persistent_memory.json` proactively with learned lessons, new operational knowledge, discovered capabilities, or refined rules.
 - **Verify via Git after edits**: After any file modification, verify correctness using `git diff` (what changed) and `git status` (untracked/modified tracking). Do NOT re-read the file with `fs_read` for verification — git tools are faster, show exactly what was inserted/removed, and confirm that untracked artifacts are properly ignored. Fall back to `fs_read` only when the repository is uninitialized and git tools are unavailable.
 - **On an unexpected tool result**: Immediately stop, create an error report and acknowledge the inability to use the tool.
 

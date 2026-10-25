@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,19 +12,26 @@ from openai import AsyncOpenAI
 from loguru import logger
 
 from context_manager import ContextPool, count_tokens, repair_tool_sequence
+from server import config as app_config
 from tool_registry import get_registry
 
-LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "30000"))
+LLM_MAX_OUTPUT_TOKENS = app_config.LLM_MAX_OUTPUT_TOKENS
 
 
 def _resolve_base_url() -> str:
-    return (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+    return app_config.DEEPSEEK_BASE_URL
 
 
 def _resolve_model() -> str:
-    raw = (os.getenv("DEEPSEEK_MODEL") or "deepseek-flash").strip() or "deepseek-flash"
-    # The API uses hyphens ("deepseek-flash"); accept the underscore spelling too.
-    return raw.replace("_", "-")
+    # The API uses hyphens ("deepseek-flash"); config accepts underscores too.
+    return app_config.DEEPSEEK_MODEL
+
+def _render_prompt_text(text: str) -> str:
+    """Expand central-config placeholders in a prompt file."""
+    for key, value in app_config.prompt_substitutions().items():
+        text = text.replace(key, value)
+    return text
+
 
 def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dict]:
     """Build base prompt messages from text/file tuples."""
@@ -40,10 +46,11 @@ def construct_history(prompts_list: list[tuple[str, Optional[str]]]) -> list[dic
                 content += fp.read_text(encoding='utf-8')
             except Exception:
                 logger.warning(f"File {prompt_file} not loaded")
+        content = _render_prompt_text(content)
         content += "\n\n---\n\n"
         composed.append({
             "role": "system",
-            "name": "Deliria",
+            "name": app_config.AGENT_DISPLAY_NAME,
             "content": content,
         })
     return composed
@@ -129,11 +136,9 @@ class Agent:
         model: str | None = None,
     ):
         self.name = name
-        self._max_tokens = int(
-            os.getenv("LLM_MAX_OUTPUT_TOKENS", str(LLM_MAX_OUTPUT_TOKENS))
-        )
+        self._max_tokens = LLM_MAX_OUTPUT_TOKENS
         self._client = AsyncOpenAI(
-            api_key=api_key or os.getenv("DEEPSEEK_API_KEY", ""),
+            api_key=api_key or app_config.DEEPSEEK_API_KEY,
             base_url=base_url or _resolve_base_url(),
         )
         self._model = model or _resolve_model()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Диагностика роста data/emergency_save.json.
+"""Диагностика роста emergency_save.json в настроенной DATA_DIR.
 
 Скрипт работает ТОЛЬКО с временной копией data/: оригинальные файлы
 открываются на чтение, их размер/mtime/хеш печатаются до и после, чтобы
@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
 
 import context_manager  # noqa: E402
 from context_manager import ContextPool  # noqa: E402
+from server import config  # noqa: E402
 
 
 def _stat(path: Path) -> str:
@@ -53,19 +54,21 @@ def _short(text: str, limit: int = 120) -> str:
 
 
 def main() -> int:
-    source = ROOT / "data"
+    source = config.DATA_DIR
     orig_save = source / "emergency_save.json"
     orig_last = source / "last_compression.txt"
 
     print("=== ОРИГИНАЛ (только чтение) ===")
-    print(f"data/emergency_save.json: {_stat(orig_save)}")
-    print(f"data/last_compression.txt: {_stat(orig_last)}")
+    print(f"{orig_save}: {_stat(orig_save)}")
+    print(f"{orig_last}: {_stat(orig_last)}")
 
     if not source.is_dir():
-        print("data/ не найден — диагностика невозможна")
+        print(f"{source} не найден — диагностика невозможна")
         return 1
 
-    with tempfile.TemporaryDirectory(prefix="inysha-diag-") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"{config.INSTANCE_SLUG}-diag-"
+    ) as tmp:
         copy_dir = Path(tmp) / "data"
         shutil.copytree(source, copy_dir)
         print(f"\n=== КОПИЯ data/ ===\n{copy_dir}")
@@ -148,8 +151,8 @@ def main() -> int:
         )
 
     print("\n=== ОРИГИНАЛ ПОСЛЕ ДИАГНОСТИКИ (должен быть тем же) ===")
-    print(f"data/emergency_save.json: {_stat(orig_save)}")
-    print(f"data/last_compression.txt: {_stat(orig_last)}")
+    print(f"{orig_save}: {_stat(orig_save)}")
+    print(f"{orig_last}: {_stat(orig_last)}")
     return 0
 
 

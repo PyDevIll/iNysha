@@ -3,7 +3,7 @@
 Run from the project root after the new function version is deployed:
 
     cd ~/iNysha
-    MAX_SUBSCRIPTION_SECRET='inysha_voice_2026' \
+    MAX_SUBSCRIPTION_SECRET='<max-subscription-secret>' \
         .venv/bin/python deploy/yandex-webhook/create_subscription.py
 
 The secret must match ``MAX_SUBSCRIPTION_SECRET`` in the function environment.

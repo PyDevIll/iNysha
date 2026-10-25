@@ -76,7 +76,7 @@ class DesktopClient:
         self._audio_queue = asyncio.Queue(maxsize=100)
 
         logger.info(
-            f"iNysha client '{self.cfg.client_id}' -> {self.cfg.server_url}"
+            f"{self.cfg.app_name} client '{self.cfg.client_id}' -> {self.cfg.server_url}"
         )
         self._hotkey_listener = start_hotkey(
             self._loop, self.toggle_session, self.cfg.hotkey

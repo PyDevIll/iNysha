@@ -1,9 +1,8 @@
-"""FastAPI entry point for the iNysha cloud server.
+"""FastAPI entry point for one configured iNysha-compatible instance.
 
-Local URL:  http://127.0.0.1:8010
-Public URL: http://2.24.160.163:8010  (plain HTTP; no nginx/TLS on this path)
-Desktop clients: ws://<host>:8010/ws/client and /ws/voice
-MAX webhook:    http://<host>:8010/inysha/max-webhook
+Identity, paths and the public MAX webhook route come from ``server.config``
+(and the checkout's ``.env``).  Local URL: http://127.0.0.1:<SERVER_PORT>.
+Desktop clients: ws://<host>:<port>/ws/client and /ws/voice.
 """
 from __future__ import annotations
 
@@ -40,16 +39,16 @@ async def lifespan(_: FastAPI):
         await runtime.shutdown()
 
 
-app = FastAPI(title="iNysha Cloud", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title=config.SERVER_TITLE, version="1.0.0", lifespan=lifespan)
 app.include_router(max_router)
 app.include_router(api_router)
 app.include_router(client_router)
 app.include_router(voice_router)
 
 # ── Статика и браузерный голосовой чат ─────────────────────────────────
-# Готовая сборка Vite лежит в static/voice/ (index.html + assets/).
-STATIC_DIR = config.ROOT / "static"
-VOICE_DIR = STATIC_DIR / "voice"
+# Готовая сборка Vite лежит в VOICE_STATIC_DIR (index.html + assets/).
+STATIC_DIR = config.STATIC_DIR
+VOICE_DIR = config.VOICE_STATIC_DIR
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # index.html сборки ссылается на абсолютные пути /assets/*.
@@ -59,7 +58,7 @@ app.mount("/assets", StaticFiles(directory=VOICE_DIR / "assets"), name="assets")
 @app.get("/voice", include_in_schema=False)
 @app.get("/voice/", include_in_schema=False)
 async def voice_page() -> FileResponse:
-    """Страница голосового чата (снаружи — /inysha/voice/)."""
+    """Страница голосового чата (снаружи может быть за префиксом прокси)."""
     return FileResponse(VOICE_DIR / "index.html")
 
 
@@ -73,6 +72,8 @@ async def audio_processor() -> FileResponse:
 async def health():
     return {
         "status": "ok" if runtime.started else "starting",
+        "instance": config.INSTANCE_SLUG,
+        "name": config.INSTANCE_NAME,
         "uptime_s": round(time.time() - runtime.started_at, 1) if runtime.started_at else 0,
         "queue": runtime.queue.qsize(),
         "queue_items": runtime.queue.snapshot(),
@@ -87,9 +88,8 @@ async def health():
 async def function_ping(request: Request):
     """Diagnostic endpoint used by the Yandex Cloud Function.
 
-    Set ``DEBUG_PING_URL=http://2.24.160.163:8010/api/function-ping`` in the
-    function environment to prove that MAX updates reach the function even
-    when forwarding fails.
+    Set ``DEBUG_PING_URL`` in the function environment to this route to prove
+    that MAX updates reach the function even when forwarding fails.
     """
     logger.info(f"Yandex function ping: {dict(request.query_params)}")
     return {"ok": True}

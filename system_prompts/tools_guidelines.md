@@ -74,9 +74,9 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 | Tool | Rating | Notes |
 |------|--------|-------|
 | `list_clients` | ★★★★★ | Lists connected desktop clients (`client_id`, name, capabilities). Use it when the user mentions a specific machine. |
-| `get_screenshot` | ★★★★★ | Captures the screen **on a connected client**, saves it under `data/screenshots/`, and returns the path for `vision_analyze`. `client_id` is optional and defaults to the origin client. |
+| `get_screenshot` | ★★★★★ | Captures the screen **on a connected client**, saves it under `{{DATA_DIR}}/screenshots/`, and returns the path for `vision_analyze`. `client_id` is optional and defaults to the origin client. |
 | `analyze_dynamic_scene` | ★★★★★ | Captures several frames on a client and analyzes the sequence with DeepSeek vision. |
-| `client_record_audio` | ★★★★☆ | Records the client microphone for a few seconds, saves a WAV under `data/downloads/`, and optionally transcribes it with Groq. |
+| `client_record_audio` | ★★★★☆ | Records the client microphone for a few seconds, saves a WAV under `{{DATA_DIR}}/downloads/`, and optionally transcribes it with Groq. |
 | `tts_speak_aloud` | ★★★★☆ | Synthesizes speech with ElevenLabs and plays it on a client's speakers. Disabled during `[Voice client]` turns because the voice pipeline already speaks the answer. |
 | `client_notify` | ★★★☆☆ | Shows a desktop notification on a connected client. |
 

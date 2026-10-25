@@ -19,7 +19,7 @@ router = APIRouter(tags=["api"])
 def _check_secret(request: HttpRequest) -> None:
     if not config.MAX_WEBHOOK_SECRET:
         return
-    provided = request.headers.get("x-inysha-secret")
+    provided = request.headers.get(config.SECRET_HEADER)
     if provided != config.MAX_WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="invalid secret")
 

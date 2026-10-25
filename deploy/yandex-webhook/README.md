@@ -5,8 +5,8 @@ an empty `message_created` update and the voice message is absent from
 `GET /messages`. Webhook delivery works.
 
 This VDS uses plain HTTP on port 8010. The Yandex function is the public
-HTTPS endpoint required by MAX and forwards updates to
-`http://2.24.160.163:8010/inysha/max-webhook`.
+HTTPS endpoint required by MAX and forwards updates to the server's
+configured `MAX_WEBHOOK_PATH` (default `/inysha/max-webhook`).
 
 The authoritative copy of the function code and deployment steps is
 [`../../YANDEX_CLOUD_SERVERLESS_FUNC.md`](../../YANDEX_CLOUD_SERVERLESS_FUNC.md).
@@ -16,9 +16,10 @@ The same code is in [`index.py`](index.py).
 
 | Variable | Value |
 |---|---|
-| `FORWARD_URL` | `http://2.24.160.163:8010/inysha/max-webhook` |
-| `MAX_WEBHOOK_SECRET` | same value as in `~/iNysha/.env` |
-| `DEBUG_PING_URL` | `http://2.24.160.163:8010/api/function-ping` (optional) |
+| `FORWARD_URL` | the server's `MAX_WEBHOOK_PATH`, e.g. `http://2.24.160.163:8010/inysha/max-webhook` |
+| `MAX_WEBHOOK_SECRET` | same value as in the server's `.env` |
+| `FORWARD_SECRET_HEADER` | must match `SECRET_HEADER` in the server's `.env` (default `X-Inysha-Secret`) |
+| `DEBUG_PING_URL` | the server's `/api/function-ping` (optional) |
 
 Entrypoint: `index.handler`. Runtime: Python 3.11/3.12.
 

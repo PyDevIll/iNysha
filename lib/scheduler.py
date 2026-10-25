@@ -1,5 +1,6 @@
 """In-process task scheduler for MASTERMIND v2.
-Persists tasks to data/scheduler_tasks.json.
+
+Persistence path comes from ``server.config`` (``SCHEDULER_TASKS_FILE``).
 """
 
 import json
@@ -7,13 +8,14 @@ import os
 import time
 import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from loguru import logger
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-TASKS_FILE = DATA_DIR / "scheduler_tasks.json"
+from server import config as app_config
+
+DATA_DIR = app_config.DATA_DIR
+TASKS_FILE = app_config.SCHEDULER_TASKS_FILE
 
 # Unique ID counter (thread-safe)
 _id_lock = threading.Lock()

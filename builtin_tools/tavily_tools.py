@@ -13,10 +13,11 @@ SDK capabilities used here (tavily-python >= 0.7):
 """
 
 import asyncio
-import os
 from typing import Optional
 
 from loguru import logger
+
+from server import config
 
 try:
     from tavily import AsyncTavilyClient
@@ -33,7 +34,7 @@ async def _get_client() -> Optional["AsyncTavilyClient"]:
     """Get configured AsyncTavilyClient or None if unavailable."""
     if not HAS_TAVILY:
         return None
-    api_key = os.environ.get("TAVILY_API_KEY", "")
+    api_key = config.TAVILY_API_KEY
     # Tavily allows keyless mode for search/extract with rate limits
     return AsyncTavilyClient(api_key=api_key) if api_key else AsyncTavilyClient()
 

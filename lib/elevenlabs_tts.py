@@ -12,20 +12,17 @@ owns the file and should delete it when it is no longer needed.
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import httpx
-from dotenv import load_dotenv
 from elevenlabs.client import AsyncElevenLabs
 from loguru import logger
 
-ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT / ".env")
+from server import config as app_config
 
-DEFAULT_OUTPUT_DIR = ROOT / "data" / "tts_cache"
+DEFAULT_OUTPUT_DIR = app_config.TTS_CACHE_DIR
 DEFAULT_MODEL = "eleven_multilingual_v2"
 DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
@@ -33,7 +30,7 @@ API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
 
 # Скорость речи ElevenLabs. Документация разрешает 0.7-1.2; 1.2 - максимум.
 # Голосовой пайплайн читает короткие реплики, поэтому быстрее = живее.
-TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.2"))
+TTS_SPEED = app_config.TTS_SPEED
 
 
 async def synthesize_to_file(
@@ -64,21 +61,16 @@ async def synthesize_to_file(
     if not text:
         return {"ok": False, "error": "text is required"}
 
-    api_key = (
-        api_key
-        or os.getenv("ELEVENLABS_API_KEY")
-        or os.getenv("ELEVENLABS_TTS_API_KEY")
-        or ""
-    )
-    voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID") or ""
-    model_id = model_id or os.getenv("ELEVENLABS_MODEL_ID") or DEFAULT_MODEL
+    api_key = api_key or app_config.ELEVENLABS_API_KEY
+    voice_id = voice_id or app_config.ELEVENLABS_VOICE_ID or ""
+    model_id = model_id or app_config.ELEVENLABS_MODEL_ID or DEFAULT_MODEL
 
     if not api_key:
         return {"ok": False, "error": "ELEVENLABS_API_KEY is not set"}
     if not voice_id:
         return {"ok": False, "error": "ELEVENLABS_VOICE_ID is not set"}
 
-    max_chars = int(os.getenv("ELEVENLABS_MAX_CHARS", "4000"))
+    max_chars = app_config.ELEVENLABS_MAX_CHARS
     if len(text) > max_chars:
         logger.warning(
             f"ElevenLabs text truncated from {len(text)} to {max_chars} chars"
@@ -150,14 +142,9 @@ def _resolve_tts_settings(
     model_id: str | None,
     api_key: str | None,
 ) -> tuple[str, str, str]:
-    api_key = (
-        api_key
-        or os.getenv("ELEVENLABS_API_KEY")
-        or os.getenv("ELEVENLABS_TTS_API_KEY")
-        or ""
-    )
-    voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID") or ""
-    model_id = model_id or os.getenv("ELEVENLABS_MODEL_ID") or DEFAULT_MODEL
+    api_key = api_key or app_config.ELEVENLABS_API_KEY
+    voice_id = voice_id or app_config.ELEVENLABS_VOICE_ID or ""
+    model_id = model_id or app_config.ELEVENLABS_MODEL_ID or DEFAULT_MODEL
     if not api_key:
         raise RuntimeError("ELEVENLABS_API_KEY is not set")
     if not voice_id:
@@ -185,7 +172,7 @@ async def stream_pcm(
     api_key, voice_id, model_id = _resolve_tts_settings(
         voice_id, model_id, api_key
     )
-    max_chars = int(os.getenv("ELEVENLABS_MAX_CHARS", "4000"))
+    max_chars = app_config.ELEVENLABS_MAX_CHARS
     if len(text) > max_chars:
         logger.warning(
             f"ElevenLabs text truncated from {len(text)} to {max_chars} chars"

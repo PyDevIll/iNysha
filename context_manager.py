@@ -28,6 +28,8 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Optional
 
+from server import config as app_config
+
 import tiktoken
 from loguru import logger
 
@@ -96,7 +98,7 @@ INTERRUPTED_TOOL_RESULT = (
 # ``[Time: ...]`` marker prepended by _dict_to_entry on every round-trip.
 _TIME_PREFIX_RE = re.compile(r"^(?:\[Time: [^\]]*\]\s*)+")
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = app_config.DATA_DIR
 
 # ── Memory Layer enum ──────────────────────────────────────────────────
 class Layer(IntEnum):

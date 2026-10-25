@@ -21,7 +21,7 @@ async def tts_generate(
         text: Text to speak (plain speech, no code/URLs).
         lang: Language hint (unused; ElevenLabs auto-detects).
         speed: Speech speed hint (unused; kept for backward compatibility).
-        output_dir: Optional output directory (default: data/tts_cache)
+        output_dir: Optional output directory (default: configured TTS cache)
 
     Returns:
         dict: {"ok": True, "path": "...", "file_size": 1234} on success
@@ -53,7 +53,7 @@ def register_all(registry) -> None:
                 },
                 "output_dir": {
                     "type": "string",
-                    "description": "Optional output directory (default: data/tts_cache)",
+                    "description": "Optional output directory (default: configured TTS cache)",
                 },
             },
             "required": ["text"],

@@ -2,12 +2,13 @@
 
 import base64
 import mimetypes
-import os
 
 from openai import AsyncOpenAI
 from loguru import logger
 
-DEEPSEEK_MODEL = "deepseek-flash"
+from server import config
+
+DEEPSEEK_MODEL = config.DEEPSEEK_MODEL
 # Thinking mode in DeepSeek is ENABLED BY DEFAULT (effort=high). It burns the
 # whole token budget on chain-of-thought: finish_reason="length" and an empty
 # answer. Verified 22.10.2026: 2.9s / 400 completion tokens / 0 chars returned
@@ -16,24 +17,14 @@ DEEPSEEK_MAX_TOKENS = 1024
 DEEPSEEK_RETRY_MAX_TOKENS = 4096
 DEEPSEEK_THINKING_DISABLED = {"thinking": {"type": "disabled"}}
 
-def _get_env_or_raise(key: str) -> str:
-    value = os.environ.get(key)
-    if not value:
-        raise ValueError(f"Environment variable {key} is not set")
-    return value
-
-
 def _deepseek_client() -> AsyncOpenAI:
     """Build an OpenAI-compatible client for the DeepSeek vision endpoint."""
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    base_url = os.getenv("DEEPSEEK_BASE_URL") or os.getenv("DEEPSEEK_API_ENDPOINT")
-    if not api_key:
-        raise ValueError("Environment variable DEEPSEEK_API_KEY is not set")
-    if not base_url:
-        raise ValueError(
-            "Neither DEEPSEEK_BASE_URL nor DEEPSEEK_API_ENDPOINT is set"
-        )
-    return AsyncOpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
+    if not config.DEEPSEEK_API_KEY:
+        raise ValueError("DEEPSEEK_API_KEY is not configured")
+    return AsyncOpenAI(
+        api_key=config.DEEPSEEK_API_KEY,
+        base_url=config.DEEPSEEK_BASE_URL,
+    )
 
 
 # Add the multi-image API caller
