@@ -20,7 +20,7 @@ async def reload_tools() -> str:
     registry = get_registry()
     count = registry.hot_reload()
     tool_list = registry.list_tools()
-    logger.info(f"Hot-reload complete: {count} modules, {len(registry._tools)} tools")
+    logger.info(f"Hot-reload complete: {count} modules, {len(registry.tool_names)} tools")
     return f"Reloaded {count} module(s).\n\n{tool_list}"
 
 

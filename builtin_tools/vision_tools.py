@@ -3,15 +3,9 @@
 import base64
 import mimetypes
 import os
-from datetime import datetime
-import asyncio
-
-import io
-from PIL import Image
 
 from openai import AsyncOpenAI
 from loguru import logger
-import atexit
 
 DEEPSEEK_MODEL = "deepseek-flash"
 # Thinking mode in DeepSeek is ENABLED BY DEFAULT (effort=high). It burns the
@@ -21,7 +15,6 @@ DEEPSEEK_MODEL = "deepseek-flash"
 DEEPSEEK_MAX_TOKENS = 1024
 DEEPSEEK_RETRY_MAX_TOKENS = 4096
 DEEPSEEK_THINKING_DISABLED = {"thinking": {"type": "disabled"}}
-_mss_instance = None
 
 def _get_env_or_raise(key: str) -> str:
     value = os.environ.get(key)
@@ -142,137 +135,6 @@ async def vision_analyze_url(image_url: str, query: str = "Опиши, что и
     return result
 
 
-# ----- Making screenshots -----
-
-def get_mss():
-    global _mss_instance
-    if not _mss_instance:
-        # Imported lazily: the cloud server has no display.
-        import mss
-        _mss_instance = mss.mss()
-    return _mss_instance
-
-
-def _capture_screenshot_to_bytes(monitor: int = 1, resize_factor: float = 0.5) -> bytes:
-    """
-    Capture a screenshot and return PNG bytes, optionally resized.
-    """
-    sct = get_mss()
-    if monitor < 0 or monitor >= len(sct.monitors):
-        logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors)-1}), using primary (1)")
-        monitor = 1
-
-    # Grab the screenshot (returns a mss.ScreenShot object)
-    raw = sct.grab(sct.monitors[monitor])
-
-    # Convert to PIL Image
-    pil_img = Image.frombytes("RGB", raw.size, raw.rgb)
-
-    # Resize if needed
-    if resize_factor != 1.0:
-        width, height = pil_img.size
-        new_size = (int(width * resize_factor), int(height * resize_factor))
-        pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
-
-    # Convert to PNG bytes
-    with io.BytesIO() as output:
-        pil_img.save(output, format="PNG")
-        return output.getvalue()
-
-
-async def analyze_dynamic_scene(
-    monitor: int = 1,
-    interval_seconds: float = 0.5,
-    num_frames: int = 5,
-    query: str = "Опиши динамические изменения в этих последовательных кадрах. Дай детальный анализ того, что происходит в целом, на русском языке."
-) -> str:
-    """
-    Capture multiple consecutive screenshots, resize them, and analyze together.
-
-    Args:
-        monitor: Monitor index (1 = primary, 2 = secondary, etc.).
-        interval_seconds: Time between captures.
-        num_frames: Number of screenshots to capture.
-        resize_factor: Scale factor for image dimensions (0.5 = half size). Default 0.5.
-        query: Question to ask about the sequence.
-
-    Returns:
-        The model's textual description of the dynamic scene.
-    """
-    resize_factor: float = 0.5
-    logger.debug(f"analyze_dynamic_scene: monitor={monitor}, interval={interval_seconds}, frames={num_frames}, resize={resize_factor}")
-
-    image_urls = []
-    for i in range(num_frames):
-        # Capture and resize in one step
-        png_bytes = _capture_screenshot_to_bytes(monitor, resize_factor)
-        b64_str = base64.b64encode(png_bytes).decode("utf-8")
-        data_url = f"data:image/png;base64,{b64_str}"
-        image_urls.append(data_url)
-
-        if i < num_frames - 1:
-            await asyncio.sleep(interval_seconds)
-
-    result = await _call_deepseek_vision(image_urls, query)
-    logger.debug(f"analyze_dynamic_scene result: {result}")
-    return result
-
-
-async def get_screenshot(monitor: int = 0) -> dict:
-    """
-    Capture a screenshot of the specified monitor and save it to /data.
-
-    Args:
-        monitor: Monitor index (0 = all monitors combined, 1 = primary, 2 = secondary, etc.).
-                 Default 0 captures the entire virtual screen.
-
-    Returns:
-        dict with keys:
-            ok (bool): Whether capture succeeded.
-            path (str): Path to the saved image (if ok).
-            file_size (int): Size of the saved file in bytes (if ok).
-            error (str): Error message if not ok.
-    """
-    from app import DATA_DIR
-    logger.debug(f"get_screenshot called with monitor={monitor}")
-
-    # Generate unique filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"screenshot_{timestamp}.png"
-    output_path = os.path.join(DATA_DIR / "screenshots", filename)
-
-    try:
-        sct = get_mss()
-        # mss monitors: index 0 is the combined virtual screen, 1..N are physical monitors
-        # If the requested monitor index is out of range, fallback to 1 (primary)
-        if monitor < 0 or monitor >= len(sct.monitors):
-            logger.warning(f"Monitor {monitor} out of range (0-{len(sct.monitors)-1}), using primary (1)")
-            monitor = 1
-
-        # Capture and save directly
-        sct.shot(mon=monitor, output=output_path)
-        logger.info(f"Screenshot saved to {output_path}")
-
-        file_size = os.path.getsize(output_path)
-        return {
-            "ok": True,
-            "path": output_path,
-            "file_size": file_size,
-        }
-    except Exception as e:
-        logger.error(f"Screenshot capture failed: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def cleanup_mss():
-    global _mss_instance
-    if _mss_instance is not None:
-        _mss_instance.close()
-        _mss_instance = None
-
-atexit.register(cleanup_mss)
-
-
 TOOL_DEFINITIONS = [
     (
         "vision_analyze",
@@ -314,53 +176,6 @@ TOOL_DEFINITIONS = [
             "required": ["image_url"],
         },
     ),
-    (
-        "get_screenshot",
-        get_screenshot,
-        "Capture a screenshot of a monitor and save it to /data",
-        {
-            "type": "object",
-            "properties": {
-                "monitor": {
-                    "type": "integer",
-                    "description": "Monitor index (0 = all monitors combined, 1 = primary, 2 = secondary, etc.)",
-                    "default": 0,
-                },
-            },
-            "required": [],
-        },
-    ),
-    (
-        "analyze_dynamic_scene",
-        analyze_dynamic_scene,
-        "Capture multiple screenshots at intervals and analyze the dynamic scene",
-        {
-            "type": "object",
-            "properties": {
-                "monitor": {
-                    "type": "integer",
-                    "description": "Monitor index (1 = primary, 2 = secondary, etc.)",
-                    "default": 1,
-                },
-                "interval_seconds": {
-                    "type": "number",
-                    "description": "Time between consecutive captures (seconds)",
-                    "default": 0.5,
-                },
-                "num_frames": {
-                    "type": "integer",
-                    "description": "Number of screenshots to capture",
-                    "default": 5,
-                },
-                "query": {
-                    "type": "string",
-                    "description": "Question to ask about the sequence",
-                    "default": "Опиши динамические изменения в этих последовательных кадрах. Дай детальный анализ того, что происходит в целом на русском языке.",
-                },
-            },
-            "required": [],
-        },
-    )
 ]
 
 

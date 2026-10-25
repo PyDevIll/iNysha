@@ -176,12 +176,15 @@ class Runtime:
 
         # get_registry() auto-registers builtins exactly once.  Do not call
         # builtin_tools.register_all() again here (it would duplicate logs and
-        # work); only layer the client-facing overrides on top.
+        # work); only install the client tool layer on top.
         registry = get_registry()
         from server.remote_tools import register_all as register_remote_tools
 
         register_remote_tools(registry)
-        logger.info(f"Registered {len(registry.tool_names)} tools")
+        logger.info(
+            f"Registered {len(registry.tool_names)} tools "
+            f"({len(registry.client_tool_names)} client-side)"
+        )
 
         self.helper = Agent(
             name="HELPER",

@@ -1,8 +1,8 @@
-"""Tools that call the connected desktop client.
+"""Server-side tools that call the connected desktop client.
 
-These override the local display/audio tools from ``builtin_tools`` on the
-cloud server.  The server has no screen, microphone or speaker; the thin
-client owns all three.
+These live in the registry's client layer, not in ``builtin_tools``: the
+server has no screen, microphone or speaker, and the thin desktop client owns
+all three.  The layer survives builtin hot reload.
 """
 
 from __future__ import annotations
@@ -220,8 +220,8 @@ async def client_notify(
 
 
 def register_all(registry) -> None:
-    """Register/override client-facing tools."""
-    registry.register_function(
+    """Install the client tool layer (desktop RPC tools)."""
+    registry.register_client_function(
         func=list_clients,
         name="list_clients",
         description=(
@@ -230,7 +230,7 @@ def register_all(registry) -> None:
         ),
         parameters={"type": "object", "properties": {}, "required": []},
     )
-    registry.register_function(
+    registry.register_client_function(
         func=get_screenshot,
         name="get_screenshot",
         description=(
@@ -258,7 +258,7 @@ def register_all(registry) -> None:
             "required": [],
         },
     )
-    registry.register_function(
+    registry.register_client_function(
         func=analyze_dynamic_scene,
         name="analyze_dynamic_scene",
         description=(
@@ -295,7 +295,7 @@ def register_all(registry) -> None:
             "required": [],
         },
     )
-    registry.register_function(
+    registry.register_client_function(
         func=tts_speak_aloud,
         name="tts_speak_aloud",
         description=(
@@ -315,7 +315,7 @@ def register_all(registry) -> None:
             "required": ["text"],
         },
     )
-    registry.register_function(
+    registry.register_client_function(
         func=client_record_audio,
         name="client_record_audio",
         description=(
@@ -343,7 +343,7 @@ def register_all(registry) -> None:
             "required": [],
         },
     )
-    registry.register_function(
+    registry.register_client_function(
         func=client_notify,
         name="client_notify",
         description="Show a desktop notification on a connected client.",
@@ -360,4 +360,4 @@ def register_all(registry) -> None:
             "required": ["message"],
         },
     )
-    logger.info("Remote client tools registered")
+    logger.info("Client tools registered")

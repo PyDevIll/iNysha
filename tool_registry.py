@@ -1,4 +1,4 @@
-"""Dynamic tool registry with hot-reload for MASTERMIND v2."""
+"""Dynamic tool registry: builtin layer + client layer, builtin hot-reload."""
 
 from __future__ import annotations
 
@@ -46,11 +46,14 @@ VOICE_DEFERRED_TOOLS = frozenset({
 
 
 class ToolRegistry:
-    """Async-first tool registry with hot-reload via importlib."""
+    """Async-first tool registry with separate builtin and client layers."""
 
     def __init__(self, tools_package: str = "builtin_tools"):
         self._tools_package = tools_package
         self._tools: Dict[str, ToolDef] = {}
+        # Server-only tools (desktop client RPC) live in a separate lifecycle
+        # layer: hot reload rebuilds builtins but must never clear this layer.
+        self._client_tools: Dict[str, ToolDef] = {}
         self._version: int = 0
         self._loaded_modules: set[str] = set()
         self._bot = None
@@ -74,8 +77,31 @@ class ToolRegistry:
 
     @property
     def tool_names(self) -> list[str]:
-        return list(self._tools.keys())
+        return list(self._visible_tools().keys())
 
+    @property
+    def client_tool_names(self) -> list[str]:
+        return list(self._client_tools.keys())
+
+    def _visible_tools(self) -> Dict[str, ToolDef]:
+        """Merged read view. Names are unique across layers."""
+        tools = dict(self._tools)
+        tools.update(self._client_tools)
+        return tools
+
+    def _assert_builtin_name_available(self, name: str) -> None:
+        if name in self._client_tools:
+            raise ValueError(
+                f"Tool '{name}' is already registered in the client layer; "
+                "remove or rename one of the definitions"
+            )
+
+    def _assert_new_client_name(self, name: str) -> None:
+        if name in self._tools or name in self._client_tools:
+            raise ValueError(
+                f"Tool '{name}' is already registered; client tools must have "
+                "unique names and cannot override builtin tools"
+            )
 
     def register(
         self,
@@ -85,6 +111,8 @@ class ToolRegistry:
         group: str = "",
     ) -> Callable:
         """Decorator to register an async tool function."""
+        self._assert_builtin_name_available(name)
+
         def wrapper(func: Callable) -> Callable:
             if not inspect.iscoroutinefunction(func):
                 logger.warning(f"Tool '{name}' is not async")
@@ -104,16 +132,41 @@ class ToolRegistry:
         self, func: Callable, name: str, description: str,
         parameters: Optional[dict] = None, group: str = "",
     ) -> None:
+        """Register a builtin (hot-reloadable) tool."""
+        self._assert_builtin_name_available(name)
         module_name = func.__module__
         self._tools[name] = ToolDef(
             name=name, description=description,
             func=func, parameters=parameters or {}, module_name=module_name,
             group=group,
         )
+        self._version += 1
+
+
+    def register_client_function(
+        self, func: Callable, name: str, description: str,
+        parameters: Optional[dict] = None, group: str = "",
+    ) -> None:
+        """Register a server-side tool that must survive builtin hot reload.
+
+        Client tools are not part of ``builtin_tools``: they depend on the
+        desktop client hub and are installed once by ``server.runtime``.
+        Duplicate names across layers are rejected instead of silently
+        replacing one implementation with another.
+        """
+        self._assert_new_client_name(name)
+        module_name = func.__module__
+        self._client_tools[name] = ToolDef(
+            name=name, description=description,
+            func=func, parameters=parameters or {}, module_name=module_name,
+            group=group,
+        )
+        self._version += 1
+        logger.debug(f"Registered client tool: {name} from {module_name}")
 
 
     def get_tool(self, name: str) -> Optional[ToolDef]:
-        return self._tools.get(name)
+        return self._client_tools.get(name) or self._tools.get(name)
 
 
     def get_openai_tools(self, voice_mode: bool | None = None) -> list[dict]:
@@ -127,13 +180,11 @@ class ToolRegistry:
         they exist.
         """
         tools = []
-        names = []
-        for tdef in self._tools.values():
+        for tdef in self._visible_tools().values():
             if tdef.name in VOICE_ONLY_TOOLS and not voice_mode:
                 continue
             if voice_mode and tdef.name in VOICE_DEFERRED_TOOLS:
                 continue
-            names.append(tdef.name)
             tools.append({
                 "type": "function",
                 "function": {
@@ -145,12 +196,12 @@ class ToolRegistry:
         return tools
 
     async def call_tool(self, tool_name: str, **kwargs: Any) -> str:
-        tdef = self._tools.get(tool_name)
+        tdef = self.get_tool(tool_name)
         if not tdef:
-            logger.error(f"call_tool: '{tool_name}' NOT FOUND. Available: {sorted(self._tools.keys())}")
-            return f"Error: tool '{tool_name}' not found"
-        tdef = self._tools.get(tool_name)
-        if not tdef:
+            logger.error(
+                f"call_tool: '{tool_name}' NOT FOUND. "
+                f"Available: {sorted(self.tool_names)}"
+            )
             return f"Error: tool '{tool_name}' not found"
         try:
             result = await tdef.func(**kwargs)
@@ -161,16 +212,12 @@ class ToolRegistry:
 
 
     def hot_reload(self) -> int:
-        """Reload all submodules and re-register their tools.
+        """Reload builtin modules and rebuild only the builtin tool layer.
 
-        Fixes applied:
-          1. Log errors from any failed submodule reload as ERROR.
-          2. Also reload the package __init__.py so that register_all
-             picks up the current submodule versions.
-          3. Catch ANY exception from register_all, not just ImportError.
-          4. Log which tools were added AND which disappeared.
-          5. Compare post-register list against TOOL_DEFINITIONS from each
-             submodule to detect missing registrations.
+        The client layer (desktop RPC tools) is installed once by
+        ``server.runtime`` and intentionally survives this operation. The
+        builtin layer is rebuilt transactionally: if registration fails, the
+        previous layer is restored instead of being left half-populated.
         """
         reloaded = 0
         package = self._tools_package
@@ -201,49 +248,55 @@ class ToolRegistry:
                 except Exception as e:
                     logger.error(f"Failed to load '{mod_name}': {e}")
 
-        # 2) Also reload the package __init__.py itself
+        # 2) Also reload the package __init__.py itself so register_all is fresh
         try:
             importlib.reload(sys.modules[package])
             reloaded += 1
         except Exception as e:
             logger.error(f"Failed to reload package '{package}': {e}")
 
-        # 3) Re-register all tools
-        old_names = set(self._tools.keys())
-        old_tools = dict(self._tools)          # save a copy before clearing
-        # ⚠️ Clear registry BEFORE re-registration so removed tools are purged
-        self._tools.clear()
+        pkg = sys.modules[package]
+        register_all = getattr(pkg, "register_all", None)
+        if register_all is None:
+            logger.error(f"Package '{package}' has no register_all()")
+            return 0
+
+        # 3) Rebuild only the builtin layer. The client layer is untouched.
+        old_tools = self._tools
+        old_names = set(old_tools)
+        self._tools = {}
         try:
-            from builtin_tools import register_all
             register_all(self)
         except Exception as e:
+            self._tools = old_tools
             logger.error(f"register_all failed: {e}")
             logger.error(traceback.format_exc())
-            # On error, restore old tools to avoid data loss
-            for k in list(old_names - set(self._tools.keys())):
-                if k in old_tools:
-                    self._tools[k] = old_tools[k]
+            logger.warning("hot_reload: restored the previous builtin tool layer")
+            return 0
 
-        new_count = len(self._tools)
-        new_names = set(self._tools.keys())
+        new_names = set(self._tools)
         added = new_names - old_names
         removed = old_names - new_names
         if added:
-            logger.info(f"hot_reload: +{len(added)} new tools: {sorted(added)}")
+            logger.info(f"hot_reload: +{len(added)} new builtin tools: {sorted(added)}")
         if removed:
-            logger.warning(f"hot_reload: -{len(removed)} tools DISAPPEARED: {sorted(removed)}")
-        logger.info(f"Registry reloaded: {reloaded} modules, {len(old_names)}→{new_count} tools")
+            logger.warning(
+                f"hot_reload: -{len(removed)} builtin tools: {sorted(removed)}"
+            )
+        logger.info(
+            f"Registry reloaded: {reloaded} modules, "
+            f"{len(old_names)}→{len(new_names)} builtin tools, "
+            f"{len(self._client_tools)} client tool(s) preserved"
+        )
 
-        # 4) Verify all TOOL_DEFINITIONS are actually registered
+        # 4) Verify all enabled TOOL_DEFINITIONS are actually registered
         self._verify_registration()
 
         self._version += 1
         return reloaded
 
     def _verify_registration(self) -> None:
-        """Check that every tool defined in TOOL_DEFINITIONS is actually
-        present in the registry after reload."""
-        import importlib
+        """Check that every enabled tool in TOOL_DEFINITIONS was registered."""
         package = self._tools_package
         pkg = sys.modules.get(package)
         if not pkg or not hasattr(pkg, '__path__'):
@@ -255,15 +308,23 @@ class ToolRegistry:
             tdefs = getattr(mod, 'TOOL_DEFINITIONS', None)
             if not tdefs:
                 continue
+            disabled = getattr(mod, "DISABLED_TOOLS", set())
             for name, func, desc, params in tdefs:
+                if name in disabled:
+                    continue
                 if name not in self._tools:
                     logger.error(f"VERIFY: tool '{name}' defined in {mod_name}.TOOL_DEFINITIONS "
                                  f"but NOT registered in registry!")
 
     def list_tools(self) -> str:
-        lines = [f"ToolRegistry v{self._version} — {len(self._tools)} tools:"]
-        for tool_name, tdef in sorted(self._tools.items()):
-            lines.append(f"  {tool_name}: {tdef.description[:80]}")
+        visible = self._visible_tools()
+        lines = [
+            f"ToolRegistry v{self._version} — {len(visible)} tools "
+            f"({len(self._tools)} builtin, {len(self._client_tools)} client):"
+        ]
+        for tool_name, tdef in sorted(visible.items()):
+            layer = "client" if tool_name in self._client_tools else "builtin"
+            lines.append(f"  {tool_name} [{layer}]: {tdef.description[:80]}")
         return '\n'.join(lines)
 _registry: Optional[ToolRegistry] = None
 _registry_initialized: bool = False

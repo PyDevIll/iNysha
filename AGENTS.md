@@ -1,6 +1,6 @@
 # AGENTS.md
 
-iНюша / Deliria is a single-agent Python assistant. The production entry point is the FastAPI cloud server (`server.main:app`); `client/` is a thin desktop body for screen, microphone and speakers. `main.py`, `app.py` and `components/` are the older local console app — not used by `server.main`, and not where cloud changes belong.
+iНюша / Deliria is a single-agent Python assistant. The production entry point is the FastAPI cloud server (`server.main:app`); `client/` is a thin desktop body for screen, microphone and speakers. The old local console app (`main.py`, `app.py`, `components/`) has been retired — screen, microphone and speaker access goes through the desktop client.
 
 ## Setup and run
 
@@ -32,8 +32,9 @@ iНюша / Deliria is a single-agent Python assistant. The production entry poi
 
 - One shared `Agent` and `ContextPool` process strictly one request at a time. Every input — MAX, `POST /api/prompt`, desktop text, voice, scheduler — must enqueue a `server.queue.Request` and let `server.runtime.worker_loop` run it. New request sources belong in `server/sources/`; voice lives in `server/voice.py`. Never call the agent directly from a new source.
 - Per-request routing uses the `current_request` ContextVar (`server/context.py`); replies go through `server/routing.py` targets (`MaxReply`, `FutureReply`, `NullReply`).
-- The server has no screen, microphone or speaker. `server/remote_tools.py` overrides the local builtin tools by name and calls a connected desktop client over `/ws/client`. Target selection is explicit `client_id`, then the origin context, then the sole connected client.
-- `get_registry()` auto-registers `builtin_tools` once and keeps it live. `runtime.startup()` only layers remote overrides; do not call `builtin_tools.register_all()` again. A new builtin module must also be added to `register_all()` in `builtin_tools/__init__.py`.
+- The server has no screen, microphone or speaker. `server/remote_tools.py` registers the client tool layer (`register_client_function`) and calls a connected desktop client over `/ws/client`. These tools are not in `builtin_tools` and must not collide with builtin names. Target selection is explicit `client_id`, then the origin context, then the sole connected client.
+- `get_registry()` auto-registers `builtin_tools` once and keeps it live. `runtime.startup()` only installs the client tool layer; do not call `builtin_tools.register_all()` again. A new builtin module must also be added to `register_all()` in `builtin_tools/__init__.py`.
+- `hot_reload()` rebuilds only the builtin layer transactionally and preserves `_client_tools`; `reload_tools` must never drop desktop-client tools or replace them with local implementations. Duplicate names across layers are an error, not an override.
 - LLM access is DeepSeek's OpenAI-compatible API (`deepseek-flash`, configured in `agent.py`). Within a turn tool calls run in parallel. Every assistant `tool_calls` group must be followed by exactly one result per id, or the provider rejects the request; `repair_tool_sequence`/`validate_message_sequence` protect window and compression boundaries. Keep the context regression tests green.
 - `ContextPool.build_llm_messages()` is the single LLM prompt-assembly path; `Agent` supplies the system/base prompts, then repairs tool pairs and validates. It also sets `base_prompt_tokens`, so overflow/compression accounting includes static prompts. Do not add a second assembler or read `ContextPool` private memory layers from `Agent`.
 - Persistent state: `data/emergency_save.json`, `data/last_compression.txt`, `data/persistent_memory.json`, `data/scheduler_tasks.json`. `last_compression.txt` is seeded exactly once into `_compressed_dicts`; do not pass it through `last_memory`, which recreates a duplicate system/base entry.

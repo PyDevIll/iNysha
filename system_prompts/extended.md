@@ -15,7 +15,6 @@ processed strictly one at a time, so all interactions share one context.
 
 | # | File                                 | Role |
 |---|--------------------------------------|------|
-| * | `main.py`                            | Legacy local entry point (loads .env, starts `app.start_app`) |
 | * | `server/main.py`                     | **Cloud entry point**: FastAPI app, lifespan, `/api/health`, routers |
 | * | `server/runtime.py`                  | Builds the shared agent, MAX bot, queue and worker; startup/shutdown |
 | * | `server/queue.py`                    | `Request` + `RequestQueue` (one turn at a time) |
@@ -24,22 +23,20 @@ processed strictly one at a time, so all interactions share one context.
 | * | `server/audio.py`                    | PCM/WAV, RMS, Groq Whisper transcription, TTS text cleanup |
 | * | `server/clients.py`                  | Desktop control WebSocket hub (`/ws/client`), auth, RPC futures |
 | * | `server/voice.py`                    | Desktop voice WebSocket (`/ws/voice`): VAD, STT, agent queue, TTS |
-| * | `server/remote_tools.py`              | Client tools: screenshot, screen sequence, mic, speakers, notify |
+| * | `server/remote_tools.py`              | Client tool layer: screenshot, screen sequence, mic, speakers, notify |
 | * | `server/vad.py`                      | WebRTC VAD utterance segmentation |
 | * | `server/sources/max.py`              | MAX webhook: parse/download/transcribe -> queue |
 | * | `server/sources/api.py`              | `POST /api/prompt` for tests and the desktop client |
 | * | `agent.py`                           | Async agent loop: prompt layers, LLM call, parallel tools |
-| * | `tool_registry.py`                   | `ToolRegistry`: register, execute, hot-reload, export schemas |
+| * | `tool_registry.py`                   | `ToolRegistry`: builtin + client layers, execute, hot-reload, schemas |
 | * | `context_manager.py`                 | `ContextPool v3`: persistent/compressed/masked/sliding memory |
 | * | `lib/max_bot.py`                     | `MAXBot`: MAX API, file download/upload, reasoning chat |
 | * | `lib/scheduler.py`                   | In-process scheduler with JSON persistence |
 | * | `lib/textio.py`                      | UTF-8/cp1251-safe file read/write and encoding repair |
-| * | `lib/tts_rest_services.py`           | Legacy local TTS/STT helpers (client-side audio) |
 | * | `system_prompts/core.md`             | IDENTITY block: agent name, goal, language, environment |
 | * | `system_prompts/tools_guidelines.md` | Available Tools block: guidelines |
 | * | `system_prompts/extended.md`         | **THIS FILE** — CAPABILITIES, RULES, ARCHITECTURE |
-| * | `builtin_tools/`                     | Tool modules: fs, edit, git, tavily, max, tts, vision, etc. |
-| * | `components/`                        | Legacy local sources (console, local mic, live) — not used by the cloud server |
+| * | `builtin_tools/`                     | Hot-reloadable tool modules: fs, edit, git, tavily, max, tts, vision |
 | * | `client/`                            | Desktop client (Ubuntu/Windows): screen, microphone, speakers, hotkey |
 
 
@@ -47,11 +44,14 @@ processed strictly one at a time, so all interactions share one context.
 
 ```
 ToolRegistry.execute(tool_name, params)
-  → lookup self._tools[tool_name]
+  → get_tool(tool_name)                # client layer first, then builtin
   → call tool_def.func(**params)       # async function
   → wrap result in {"ok": True/False, "result": ..., "error": ...}
   → return to agent loop
 ```
+
+Builtin tools are hot-reloadable; client tools (`server/remote_tools.py`) are installed once at startup
+and survive `reload_tools`. Tool names are unique across both layers.
 
 ---
 
@@ -108,10 +108,11 @@ def register_all(registry):
     logger.info("All builtin tools registered")
 ```
 
-**6. ⚠️ CRITICAL — New modules require restart.** 
-   - Adding tools to an **existing** module file → `reload_tools` works (the submodule is reloaded via `pkgutil.iter_modules`)
-   - Creating a **new** `.py` file in `builtin_tools/` → requires updating `__init__.py`'s static import list AND its `register_all()` body. But `hot_reload()` does NOT reload `__init__.py` (the package itself), so the new import has NO effect until full app restart.
-   - **RULE**: All new tools MUST be added to EXISTING module files only. Never create new `.py` modules in `builtin_tools/` unless you accept a mandatory restart.
+**6. Hot reload scope.**
+   - Adding tools to an **existing** module file → `reload_tools` works (the submodule is reloaded via `pkgutil.iter_modules`).
+   - Creating a **new** `.py` file in `builtin_tools/` → also add it to `__init__.py`'s import list and `register_all()`. `hot_reload()` reloads both submodules and the package `__init__.py`, so it can pick up the new module; restart if the result looks stale.
+   - `reload_tools` only reloads `builtin_tools`. Changes in `lib/` or `server/` (including `server/remote_tools.py`) still require a service restart.
+   - The client tool layer in `server/remote_tools.py` is intentionally preserved across builtin reloads.
 
 **7. Update this file.** Add the new tool to the CAPABILITIES section below.
 
@@ -124,19 +125,22 @@ def register_all(registry):
 
 ### Registration API reference
 ```python
-# Direct registration (used by register_all patterns):
+# Direct builtin registration (used by register_all patterns):
 ToolRegistry.register_function(func, name, description, parameters)
 
-# Decorator-based registration (alternative):
+# Client-layer registration (server/remote_tools.py only):
+ToolRegistry.register_client_function(func, name, description, parameters)
+
+# Decorator-based registration (alternative, builtin layer):
 @registry.register(name="tool_name", description="...", parameters={...})
 async def my_tool(...): ...
 
-# Hot-reload:
-ToolRegistry.hot_reload()  # Reloads all modules + calls register_all()
+# Hot-reload (builtin layer only; client tools survive):
+ToolRegistry.hot_reload()
 
 # Query:
 ToolRegistry.get_openai_tools()  # Returns list in OpenAI function-calling format
-ToolRegistry.list_tools()        # Returns dict of {name: description}
+ToolRegistry.list_tools()        # Returns a human-readable string
 ```
 
 ## **CAPABILITIES**
