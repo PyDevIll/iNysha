@@ -12,7 +12,7 @@ from typing import Optional
 from openai import AsyncOpenAI
 from loguru import logger
 
-from context_manager import ContextPool, repair_tool_sequence
+from context_manager import ContextPool, count_tokens, repair_tool_sequence
 from tool_registry import get_registry
 
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "30000"))
@@ -144,6 +144,7 @@ class Agent:
         self._save_history = save_history
         self._helper_agent: Optional[Agent] = None
         self.messages = ContextPool()
+        self.messages.set_base_prompt_tokens(self._static_prompt_tokens())
 
         # Load legacy last_memory (for backward compatibility). ContextPool
         # отфильтрует system/base-промпты, а прошлая выжимка из
@@ -156,6 +157,16 @@ class Agent:
 
     def add_helper_agent(self, helper: Agent) -> None:
         self._helper_agent = helper
+
+    def _static_prompt_tokens(self) -> int:
+        """Token cost of the system prompt plus all base prompt files."""
+        base_messages = construct_history(self._base_prompts)
+        total = count_tokens(self._system_prompt["content"])
+        total += sum(
+            count_tokens(message.get("content") or "")
+            for message in base_messages
+        )
+        return total
 
     @property
     def registry(self):
@@ -224,83 +235,18 @@ class Agent:
     def _build_messages_for_llm(self) -> list[dict]:
         """Build full message list with all memory layers.
 
-        Order (DeepSeek cache-optimized):
-          system → base_prompts → persistent → compressed → masked → sliding window
+        Layer assembly lives in ``ContextPool.build_llm_messages()`` so the
+        agent, tests and diagnostics all use the same path.  Order is
+        DeepSeek cache-optimized:
 
-        Critical: every assistant message MUST have non-empty content OR tool_calls.
+          system → base prompts → persistent → compressed → masked → sliding
         """
         self.messages.log_state("STATE AT build_messages_for_llm")
-        messages: list[dict] = []
 
-        # Layer 0: System prompt (static → prefix-cached by DeepSeek)
-        messages.append(self._system_prompt)
-
-        # Layer 1: Base prompts (tool definitions, guidelines — static)
-        if self._base_prompts:
-            messages.extend(construct_history(self._base_prompts))
-
-        # Layer 2: Persistent memory (key facts across sessions)
-        persistent = self.messages._persistent.as_context_string()
-        if persistent:
-            messages.append({
-                "role": "user",
-                "name": "MASTERMIND",
-                "content": persistent,
-            })
-
-        # Layer 3: Compressed history (structured summaries from _compressed_dicts)
-        logger.debug(f"Adding {len(self.messages._compressed_dicts)} compressed entries to context")
-        for comp_dict in self.messages._compressed_dicts:
-            # Build a single assistant message from the structured sections
-            content_parts = []
-            if comp_dict.get("facts"):
-                content_parts.append(f"**Key Facts:**\n{comp_dict['facts']}")
-            if comp_dict.get("tool_results"):
-                content_parts.append(f"**Tool Results:**\n{comp_dict['tool_results']}")
-            if comp_dict.get("decisions"):
-                content_parts.append(f"**Decisions:**\n{comp_dict['decisions']}")
-            # narrative уже хранится в сжатом блоке — не теряем его при сборке.
-            if comp_dict.get("narrative"):
-                content_parts.append(f"**Narrative:**\n{comp_dict['narrative']}")
-            if not content_parts and comp_dict.get("raw_text"):
-                content_parts.append(comp_dict["raw_text"])
-            if not content_parts:
-                content_parts.append("[No structured summary]")
-            content = "\n\n".join(content_parts)
-            messages.append({
-                "role": "assistant",
-                "content": content,
-                "time": comp_dict.get("timestamp", ""),
-            })
-
-        # Layer 4 + 5 are read from a single snapshot: background compression can
-        # replace the log between two property reads otherwise.
-        masked_entries, sliding_entries = self.messages.snapshot()
-
-        # Layer 4: Masked observations (old tool outputs replaced with [MASKED: ...])
-        for entry in masked_entries:
-            d = {"role": entry.role, "content": entry.content}
-            if entry.tool_name:
-                d["name"] = entry.tool_name
-            if entry.tool_call_id:
-                d["tool_call_id"] = entry.tool_call_id
-            if entry.tool_calls:
-                d["tool_calls"] = entry.tool_calls
-            if entry.reasoning:
-                d["reasoning_content"] = entry.reasoning
-            # Safety: ensure assistant messages always have content or tool_calls
-            if entry.role == "assistant" and not d.get("content") and not d.get("tool_calls"):
-                if entry.reasoning:
-                    d["content"] = f"[Thought: {entry.reasoning.split(chr(10))[0][:200]}]"
-                else:
-                    d["content"] = "[No content]"
-            messages.append(d)
-
-
-        # Layer 5: Sliding window – last N entries from the master log.
-        for entry in sliding_entries:
-            messages.append(self.messages._entry_to_openai_dict(entry))
-
+        messages = self.messages.build_llm_messages(
+            self._system_prompt,
+            construct_history(self._base_prompts),
+        )
 
         # ---- NORMALISE: guarantee a valid tool-call / tool-result pairing ----
         # A crash between persisting an assistant tool call and its result (or a
@@ -313,7 +259,6 @@ class Agent:
             validate_message_sequence(fixed_messages)
         except ValueError as e:
             logger.error(f"Message sequence validation failed: {e}")
-            import json
             with open("invalid_messages.json", "w", encoding='utf-8') as f:
                 json.dump(fixed_messages, f, indent=2, default=str)
             raise

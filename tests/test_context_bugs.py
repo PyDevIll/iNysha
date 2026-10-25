@@ -93,6 +93,7 @@ class ContextBugsTest(unittest.TestCase):
 
         self.assertIn("**Narrative:**", text)
         self.assertIn("Synthetic narrative for the regression test.", text)
+        self.assertIn("[Compression timestamp:", text)
 
     def test_agent_layer3_contains_narrative(self) -> None:
         """narrative доходит до LLM через слой 3 (Agent._build_messages_for_llm)."""
@@ -113,6 +114,25 @@ class ContextBugsTest(unittest.TestCase):
 
         self.assertIn("**Narrative:**", all_content)
         self.assertIn("Synthetic narrative for the regression test.", all_content)
+        self.assertIn("[Compression timestamp:", all_content)
+
+    def test_base_prompt_tokens_include_system_and_base_prompts(self) -> None:
+        """Overflow accounting includes the static system/base prompt cost."""
+        with mock.patch.object(context_manager, "DATA_DIR", self.data_dir):
+            agent = agent_module.Agent(
+                name="TEST",
+                system_prompt="test system prompt",
+                base_prompts=[("BASE PROMPT", None)],
+                use_tools=False,
+                save_history=False,
+                api_key="test-key",
+                base_url="http://127.0.0.1:1/v1",
+            )
+
+        expected = context_manager.count_tokens("test system prompt")
+        expected += context_manager.count_tokens("BASE PROMPT\n\n---\n\n")
+        self.assertEqual(agent.messages.base_prompt_tokens, expected)
+        self.assertGreaterEqual(agent.messages.get_assembled_tokens(), expected)
 
     def test_assign_messages_filters_system_base_prompt(self) -> None:
         """assign_messages не кладёт base-промпт в _all_entries."""

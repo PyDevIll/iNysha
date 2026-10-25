@@ -318,84 +318,6 @@ class PersistentStore:
         return "\n".join(lines) + "\n"
 
 
-# ── Context Assembler ──────────────────────────────────────────────────
-class ContextAssembler:
-    """Assembles memory layers into a single context string for the LLM.
-
-    Order (DeepSeek cache-optimized):
-      system → persistent → compressed → masked → sliding → current
-    """
-
-    def __init__(self, token_limit: int = DEFAULT_MAX_TOKENS):
-        self.budget = TokenBudget(limit=token_limit)
-
-    def assemble(
-        self,
-        system_prompt: str,
-        persistent: str,
-        compressed: list[MemoryEntry],
-        masked: list[MemoryEntry],
-        sliding: list[MemoryEntry],
-    ) -> tuple[str, TokenBudget]:
-        """Build final context string. Returns (text, budget)."""
-        self.budget = TokenBudget(limit=self.budget.limit)
-        parts: list[str] = []
-
-        # 1. System prompt (static → DeepSeek prefix cache)
-        parts.append(system_prompt)
-        self.budget.used += self.budget.count(system_prompt)
-
-        # 2. Persistent facts
-        if persistent:
-            parts.append(persistent)
-            self.budget.used += self.budget.count(persistent)
-
-        # 3. Compressed history (LLM summaries)
-        for entry in compressed:
-            text = self._entry_to_text(entry)
-            if self.budget.remaining > self.budget.count(text):
-                parts.append(text)
-                self.budget.used += self.budget.count(text)
-                self.budget.used += self.budget.count(entry.reasoning)
-
-        # 4. Masked observations
-        for entry in masked:
-            text = self._entry_to_text(entry)
-            if self.budget.remaining > self.budget.count(text):
-                parts.append(text)
-                self.budget.used += self.budget.count(text)
-
-        # 5. Sliding window (verbatim, newest first in prompt order)
-        for entry in sliding:
-            text = self._entry_to_text(entry)
-            if self.budget.remaining > self.budget.count(text):
-                parts.append(text)
-                self.budget.used += self.budget.count(text)
-                self.budget.used += self.budget.count(entry.reasoning)
-            else:
-                logger.warning("Token budget exhausted — truncating sliding window")
-
-        return "\n\n".join(parts), self.budget
-
-    @staticmethod
-    def _entry_to_text(entry: MemoryEntry) -> str:
-        """Convert a MemoryEntry to prompt text."""
-        time_str = f"[{entry.time}]" if entry.time else ""
-        if entry.role == "system":
-            return entry.content
-        elif entry.role == "assistant":
-            text = f"**ASSISTANT** {time_str}"
-            if entry.reasoning:
-                text += f"\n*reasoning:* {entry.reasoning}"
-            if entry.content:
-                text += f"\n{entry.content}"
-            return text
-        elif entry.role == "tool":
-            return f"**TOOL [{entry.tool_name}]** {time_str}\n{entry.content}"
-        else:
-            return f"**{entry.role.upper()}** {time_str}\n{entry.content}"
-
-
 # ── ContextPool v3 ─────────────────────────────────────────────────────
 class ContextPool:
     """Hybrid context manager with observation masking, LLM summarization, and crash recovery."""
@@ -420,7 +342,6 @@ class ContextPool:
         # Infrastructure
         self._masker = ObservationMasker()
         self._persistent = PersistentStore(self._data_dir)
-        self._assembler = ContextAssembler(token_limit=max_tokens)
         self._save_counter: int = 0
         self.overflow: bool = False
         self.base_prompt_tokens: int = 0   # static system+base prompt cost (set by Agent)
@@ -509,6 +430,11 @@ class ContextPool:
             text = d.get("raw_text") or ""
         return _token_count(text)
 
+    def set_base_prompt_tokens(self, tokens: int) -> None:
+        """Record the static system/base prompt cost and refresh overflow."""
+        self.base_prompt_tokens = max(0, int(tokens))
+        self._check_overflow()
+
     def get_assembled_tokens(self) -> int:
         """Estimated tokens of the ACTUAL prompt layers this pool contributes.
 
@@ -596,20 +522,76 @@ class ContextPool:
             lines.append("---")
         return "\n".join(lines)
 
-    def build_context(self, system_prompt: str = "") -> tuple[str, TokenBudget]:
-        """Assemble full context from all layers. Returns (text, budget)."""
-        persistent = self._persistent.as_context_string()
-        # Convert compressed dicts to MemoryEntry list for assembly
-        compressed_mems = [self._compressed_dict_to_entry(d) for d in self._compressed_dicts]
-        logger.debug(f"build_context: compressed entries count = {len(self._compressed_dicts)}")
-        masked, sliding = self.snapshot()
-        return self._assembler.assemble(
-            system_prompt=system_prompt,
-            persistent=persistent,
-            compressed=compressed_mems,
-            masked=masked,
-            sliding=sliding,
+    def build_llm_messages(
+        self,
+        system_message: dict,
+        base_messages: Optional[list[dict]] = None,
+    ) -> list[dict]:
+        """Build the single, canonical OpenAI-format message list for the LLM.
+
+        This is the only assembly path used by the agent and tests.  The order
+        is intentionally cache-friendly:
+
+          system → base prompts → persistent → compressed → masked → sliding
+
+        Keeping this inside ``ContextPool`` means callers no longer have to
+        reach into ``_persistent`` / ``_compressed_dicts`` / ``_all_entries``
+        to assemble a prompt.
+        """
+        messages: list[dict] = [dict(system_message)]
+        if base_messages:
+            messages.extend(dict(message) for message in base_messages)
+
+        # The static prompt cost belongs to overflow accounting too; keep it in
+        # sync with the exact messages this method is about to send.
+        static_tokens = sum(
+            _token_count(message.get("content") or "") for message in messages
         )
+        if static_tokens != self.base_prompt_tokens:
+            self.set_base_prompt_tokens(static_tokens)
+
+        persistent = self._persistent.as_context_string()
+        if persistent:
+            messages.append({
+                "role": "user",
+                "name": "MASTERMIND",
+                "content": persistent,
+            })
+
+        for comp_dict in self._compressed_dicts:
+            messages.append(self._compressed_dict_to_openai_dict(comp_dict))
+
+        # One snapshot for both layers: background compression may replace the
+        # log between two property reads, which would duplicate/drop messages.
+        masked_entries, sliding_entries = self.snapshot()
+        for entry in masked_entries:
+            messages.append(self._entry_to_openai_dict(entry))
+        for entry in sliding_entries:
+            messages.append(self._entry_to_openai_dict(entry))
+
+        return messages
+
+    def build_context(self, system_prompt: str = "") -> tuple[str, TokenBudget]:
+        """Diagnostic text rendering of the canonical message list.
+
+        Kept for scripts/tests that want a readable dump.  Production uses
+        ``build_llm_messages()`` so both paths cannot drift apart.
+        """
+        messages = self.build_llm_messages(
+            {"role": "system", "content": system_prompt}
+        )
+        parts: list[str] = []
+        for message in messages:
+            content = message.get("content") or ""
+            if not content:
+                continue
+            role = message.get("role", "unknown")
+            if role == "system":
+                parts.append(content)
+            else:
+                parts.append(f"**{role.upper()}**\n{content}")
+        text = "\n\n".join(parts)
+        return text, TokenBudget(limit=self.max_tokens, used=_token_count(text))
 
     # ── Compression ────────────────────────────────────────────────
     async def compress(self, helper_agent, force: bool = False) -> Optional[str]:
@@ -1100,6 +1082,19 @@ class ContextPool:
             time=comp_timestamp,
             layer=Layer.COMPRESSED,
         )
+
+    def _compressed_dict_to_openai_dict(self, d: dict) -> dict:
+        """Render one structured summary as an LLM message.
+
+        ``_compressed_dict_to_entry()`` already adds the compression timestamp
+        prefix; keep the ``time`` field as well for backwards compatibility
+        with the previous agent-side assembly.
+        """
+        entry = self._compressed_dict_to_entry(d)
+        message = self._entry_to_openai_dict(entry)
+        if entry.time:
+            message["time"] = entry.time
+        return message
 
     def _entry_to_dict(self, entry: MemoryEntry) -> dict:
         """Serialize MemoryEntry to dict. Preserves tool_calls for crash recovery."""
