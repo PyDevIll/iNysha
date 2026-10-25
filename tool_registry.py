@@ -27,21 +27,20 @@ class ToolDef:
 # Tools exposed to the model only inside a voice turn (see get_openai_tools).
 VOICE_ONLY_TOOLS = frozenset({"start_tool", "check_tool", "list_tool_tasks"})
 
-# Медленные инструменты: сеть, внешние API, распознавание картинок.
-# В голосовом ходе они не показываются модели напрямую — только через start_tool
-# (fire-and-forget), иначе ответ ждёт 3-10 секунд и разговор рассыпается.
-# В текстовых сессиях (MAX, desktop) доступны как обычно.
-VOICE_DEFERRED_TOOLS = frozenset({
-    "rest_api_call",
-    "tavily_search",
-    "tavily_browse",
-    "tavily_map",
-    "tavily_research",
-    "get_screenshot",
-    "analyze_dynamic_scene",
-    "vision_analyze",
-    "vision_analyze_url",
-    "aider_run",
+# Strict allowlist for direct calls during a voice turn.  Everything else is
+# reachable only through start_tool, which returns immediately and delivers the
+# result as a separate turn.  Keep this list to quick/local/control tools; a
+# missing name is intentionally hidden rather than merely discouraged.
+VOICE_DIRECT_TOOLS = frozenset({
+    "start_tool",
+    "check_tool",
+    "list_tool_tasks",
+    "fs_read",
+    "fs_stat",
+    "list_clients",
+    "schedule_task",
+    "list_scheduled_tasks",
+    "cancel_scheduled_task",
 })
 
 
@@ -169,21 +168,31 @@ class ToolRegistry:
         return self._client_tools.get(name) or self._tools.get(name)
 
 
+    def is_tool_allowed(
+        self, name: str, *, voice_mode: bool = False
+    ) -> bool:
+        """Whether ``name`` may be called directly in the current mode.
+
+        Background execution via ``start_tool`` is a separate path and may
+        call tools that are not in the voice allowlist.
+        """
+        if self.get_tool(name) is None:
+            return False
+        if voice_mode:
+            return name in VOICE_DIRECT_TOOLS
+        return name not in VOICE_ONLY_TOOLS
+
     def get_openai_tools(self, voice_mode: bool | None = None) -> list[dict]:
         """Export tools for the LLM.
 
-        ``voice_mode=True`` additionally exposes the fire-and-forget tools
-        (start_tool / check_tool / list_tool_tasks) that make the agent
-        responsive during a spoken turn, and hides the slow network/vision
-        tools (VOICE_DEFERRED_TOOLS) — those are reachable only through
-        start_tool. In text sessions they are hidden so the model never knows
-        they exist.
+        Text sessions get the normal tool set except the fire-and-forget
+        helpers.  Voice sessions get only ``VOICE_DIRECT_TOOLS``; all slow or
+        otherwise blocking tools are reachable through ``start_tool`` and are
+        deliberately absent from the schema.
         """
         tools = []
         for tdef in self._visible_tools().values():
-            if tdef.name in VOICE_ONLY_TOOLS and not voice_mode:
-                continue
-            if voice_mode and tdef.name in VOICE_DEFERRED_TOOLS:
+            if not self.is_tool_allowed(tdef.name, voice_mode=bool(voice_mode)):
                 continue
             tools.append({
                 "type": "function",

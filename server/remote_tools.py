@@ -19,7 +19,7 @@ from lib.elevenlabs_tts import synthesize_pcm_bytes
 from server import config
 from server.audio import sanitize_for_tts, transcribe_bytes
 from server.clients import hub
-from server.context import get_request_context
+from server.context import is_voice_context
 
 
 def _safe_client_id(client_id: str) -> str:
@@ -121,8 +121,7 @@ async def tts_speak_aloud(
     client_id: str | None = None,
 ) -> dict[str, Any]:
     """Synthesize speech and play it on the target client's speakers."""
-    ctx = get_request_context()
-    if ctx is not None and ctx.source == "voice":
+    if is_voice_context():
         return {
             "ok": False,
             "error": (

@@ -262,27 +262,55 @@ def _truncate_result(text: str, limit: int = RESULT_CHAR_LIMIT) -> str:
 
 
 _TOOL_TASKS: _Dict[str, dict] = {}
+_RUNNING_TASKS: set[asyncio.Task] = set()
 _TASKS_TTL = 3600.0          # forget finished tasks after an hour
 _MAX_FINISHED = 200          # hard cap on remembered finished tasks
+
+
+def _track_task(task: asyncio.Task) -> None:
+    """Keep a strong reference so the event loop cannot GC the task."""
+    _RUNNING_TASKS.add(task)
+    task.add_done_callback(_RUNNING_TASKS.discard)
 
 
 def _prune_tasks() -> None:
     """Drop old finished tasks so the dict cannot grow forever."""
     now = time.time()
     finished = [(tid, t) for tid, t in _TOOL_TASKS.items() if t["status"] != "running"]
-    for tid, t in finished[:_MAX_FINISHED]:
-        pass
     excess = len(finished) - _MAX_FINISHED
-    for tid, t in finished[:max(0, excess)]:
+    for tid, _ in finished[:max(0, excess)]:
         _TOOL_TASKS.pop(tid, None)
     for tid, t in list(_TOOL_TASKS.items()):
         if t["status"] != "running" and now - t.get("finished_at", now) > _TASKS_TTL:
             _TOOL_TASKS.pop(tid, None)
 
 
+def _current_voice_session_id() -> str | None:
+    try:
+        from server.context import get_request_context
+    except Exception:
+        return None
+    ctx = get_request_context()
+    return ctx.voice_session_id if ctx is not None else None
+
+
+def _task_matches_current_session(task: dict) -> bool:
+    session_id = _current_voice_session_id()
+    return bool(session_id and task.get("voice_session_id") == session_id)
+
+
 def _describe_task(tid: str, t: dict, with_result: bool = False) -> str:
     age = round(time.time() - t["started_at"], 1)
-    head = f"task_id={tid} | tool={t['tool']} | status={t['status']} | elapsed={age}s"
+    if t.get("delivered"):
+        delivery = "delivered"
+    elif t.get("consumed"):
+        delivery = "claimed"
+    else:
+        delivery = "pending"
+    head = (
+        f"task_id={tid} | tool={t['tool']} | status={t['status']} | "
+        f"elapsed={age}s | delivery={delivery}"
+    )
     if with_result:
         if t["status"] == "ready":
             return head + f"\nRESULT:\n{t['result']}"
@@ -294,11 +322,14 @@ def _describe_task(tid: str, t: dict, with_result: bool = False) -> str:
 async def _deliver_tool_result(task: dict, tid: str) -> None:
     """Push a finished background result into the agent queue as its own turn.
 
-    The model MUST see every tool result, so instead of relying on the model
-    to call ``check_tool`` we enqueue a ``Request(source="tool_result")``.
-    The worker picks it up automatically and the result lands in the context
-    of a fresh turn, keeping the OpenAI tool_call/tool pairing intact.
+    Delivery is exactly-once: a result claimed by ``check_tool`` is not
+    enqueued, and an automatically delivered result cannot be claimed again.
+    For a voice session, speech is scheduled asynchronously by ``VoiceReply``;
+    this coroutine must not wait for playback.
     """
+    if task.get("consumed") or task.get("delivered"):
+        return
+
     try:
         from server.runtime import runtime as rt
     except Exception as e:
@@ -320,17 +351,17 @@ async def _deliver_tool_result(task: dict, tid: str) -> None:
         except Exception:
             reply = NullReply()
     elif client_id:
-        # Фоновый ход в голосовой сессии: говорим вслух, если сессия жива.
-        # Пустой ответ агента = молчание (VoiceHub.send_spoken это уважает).
         try:
             from server.voice import voice_hub
-            # Не наезжаем на текущую реплику: ждём, пока пользователь
-            # дослушает её, потом говорим.
-            await voice_hub.wait_idle(
-                str(client_id),
-                timeout=20.0,
-                session_id=voice_session_id,
-            )
+            if voice_session_id and not voice_hub.is_live(
+                str(client_id), session_id=voice_session_id
+            ):
+                logger.info(
+                    f"tool task {tid}: voice session {voice_session_id} "
+                    "is gone; result not spoken"
+                )
+                task["delivered"] = True
+                return
             reply = VoiceReply(
                 voice_hub,
                 str(client_id),
@@ -353,7 +384,12 @@ async def _deliver_tool_result(task: dict, tid: str) -> None:
         tool_name=task["tool"],
         reply=reply,
     )
-    await rt.queue.put(req)
+    task["delivered"] = True
+    try:
+        await rt.queue.put(req)
+    except Exception:
+        task["delivered"] = False
+        raise
     logger.info(
         f"tool task {tid} ({task['tool']}) -> queue as request {req.id} "
         f"(status={task['status']}, queue left={rt.queue.qsize()})"
@@ -382,21 +418,26 @@ async def _run_tool_task(tid: str, tool: str, kwargs: dict) -> None:
         task["finished_at"] = time.time()
         _prune_tasks()
         if task.get("auto_deliver", True):
-            await _deliver_tool_result(task, tid)
+            try:
+                await _deliver_tool_result(task, tid)
+            except Exception:
+                logger.exception(f"tool task {tid}: deferred delivery failed")
 
 
-async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0) -> str:
+async def start_tool(tool: str, arguments: str = "{}") -> str:
     """Launch any tool in the background and return a receipt immediately.
 
-    The agent does not wait for the tool: it gets a task_id back and keeps talking.
-    Retrieve the outcome later with check_tool(task_id) or list_tool_tasks().
+    The agent does not wait for the tool: it gets a task_id back and keeps
+    talking. The result is delivered automatically as a separate turn. Use
+    ``check_tool`` only for a status peek or to claim the result early.
     """
     from tool_registry import get_registry
-    from server.context import get_request_context
-    ctx = get_request_context()
-    if not (ctx and str(ctx.source).startswith("voice")):
+    from server.context import get_request_context, is_voice_context
+
+    if not is_voice_context():
         return ("Error: start_tool is available only in a voice turn. "
                 "Call the tool directly instead — waiting for its result is fine here.")
+    ctx = get_request_context()
     registry = get_registry()
     if registry.get_tool(tool) is None:
         return f"Error: tool '{tool}' not found"
@@ -407,9 +448,6 @@ async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0)
         return f"Error: invalid JSON in arguments — {e}"
     if not isinstance(kwargs, dict):
         return "Error: arguments must be a JSON object"
-
-    if delay_seconds and float(delay_seconds) > 0:
-        await asyncio.sleep(float(delay_seconds))
 
     tid = _uuid.uuid4().hex[:8]
     _TOOL_TASKS[tid] = {
@@ -425,37 +463,68 @@ async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0)
         "voice_session_id": getattr(ctx, "voice_session_id", None),
         "source": getattr(ctx, "source", None),
         "auto_deliver": True,
+        "delivered": False,
+        "consumed": False,
     }
-    asyncio.create_task(_run_tool_task(tid, tool, kwargs))
-    logger.info(f"start_tool: {tool}({json.dumps(kwargs, ensure_ascii=False)[:120]}) -> task {tid}")
-    return (f"RECEIPT: task_id={tid} | tool={tool} | status=running\n"
-            f"Не говори, что результат уже есть. Скажи, что проверяешь, и забери результат через check_tool('{tid}').")
+    _track_task(asyncio.create_task(_run_tool_task(tid, tool, kwargs)))
+    logger.info(
+        f"start_tool: {tool}({json.dumps(kwargs, ensure_ascii=False)[:120]}) "
+        f"-> task {tid}"
+    )
+    return (
+        f"RECEIPT: task_id={tid} | tool={tool} | status=running\n"
+        "Результат придёт автоматически отдельной репликой, когда будет готов. "
+        "Не повторяй его. check_tool — только для мгновенного статуса или "
+        "досрочного получения."
+    )
 
 
-async def check_tool(task_id: str, wait_seconds: float = 0, consume: bool = False) -> str:
-    """Check a fire-and-forget task: running / ready / failed, with the result when ready."""
+async def check_tool(task_id: str) -> str:
+    """Instant status check; claims an undelivered ready result.
+
+    There is deliberately no waiting: a voice turn must stay responsive.
+    If the result was already delivered or claimed earlier, do not repeat it.
+    """
     tid = (task_id or "").strip()
     task = _TOOL_TASKS.get(tid)
-    if task is None:
-        return f"Error: task '{tid}' not found (expired or never existed)"
+    if task is None or not _task_matches_current_session(task):
+        return f"Error: task '{tid}' not found (expired or belongs to another session)"
 
-    deadline = time.time() + min(float(wait_seconds or 0), 30.0)
-    while task["status"] == "running" and time.time() < deadline:
-        await asyncio.sleep(0.25)
+    if task["status"] == "running":
+        return _describe_task(tid, task, with_result=False)
+    if task.get("delivered"):
+        return (
+            _describe_task(tid, task, with_result=False)
+            + "\nResult was already delivered automatically; do not repeat it."
+        )
+    if task.get("consumed"):
+        return (
+            _describe_task(tid, task, with_result=False)
+            + "\nResult was already claimed; do not repeat it."
+        )
 
-    out = _describe_task(tid, task, with_result=True)
-    if task["status"] != "running" and consume:
-        _TOOL_TASKS.pop(tid, None)
-        out += "\n(task consumed)"
-    return out
+    task["consumed"] = True
+    task["auto_deliver"] = False
+    return _describe_task(tid, task, with_result=True) + "\n(claimed)"
 
 
 async def list_tool_tasks() -> str:
-    """List all background tool tasks and their status."""
-    if not _TOOL_TASKS:
+    """List background tool tasks belonging to the current voice session."""
+    session_id = _current_voice_session_id()
+    if not session_id:
         return "No background tool tasks."
-    lines = [_describe_task(tid, t) for tid, t in sorted(_TOOL_TASKS.items(), key=lambda kv: kv[1]["started_at"])]
-    running = sum(1 for t in _TOOL_TASKS.values() if t["status"] == "running")
+    tasks = [
+        (tid, task)
+        for tid, task in _TOOL_TASKS.items()
+        if task.get("voice_session_id") == session_id
+    ]
+    if not tasks:
+        return "No background tool tasks."
+    lines = [
+        _describe_task(tid, task)
+        for tid, task in sorted(tasks, key=lambda kv: kv[1]["started_at"])
+    ]
+    running = sum(1 for _, task in tasks if task["status"] == "running")
     return f"tasks={len(lines)} | running={running}\n" + "\n".join(lines)
 
 
@@ -512,25 +581,22 @@ TOOL_DEFINITIONS = [
         },
         "required": ["task_id"],
     }),
-    ("start_tool", start_tool, "Launch ANY tool in the background (fire-and-forget) and get a receipt with task_id immediately, without waiting for the result. Use it when the tool is slow and you want to keep talking. Retrieve the outcome later with check_tool(task_id).", {
+    ("start_tool", start_tool, "Launch ANY tool in the background (fire-and-forget) and get a task_id immediately, without waiting for the result. Use it for every slow/network/vision/MAX/TTS/exec tool during a voice turn. The result is delivered automatically as a separate spoken turn; do not repeat it.", {
         "type": "object",
         "properties": {
-            "tool": {"type": "string", "description": "Name of the tool to run in background (e.g. tavily_search, exec_shell)"},
+            "tool": {"type": "string", "description": "Name of the tool to run in background (e.g. tavily_search, exec_shell, client_record_audio)"},
             "arguments": {"type": "string", "description": "JSON object string with tool arguments, e.g. {\"query\": \"...\"} (default: {})"},
-            "delay_seconds": {"type": "number", "description": "Optional delay before starting the tool (default: 0)"},
         },
         "required": ["tool"],
     }),
-    ("check_tool", check_tool, "Check the status of a background (fire-and-forget) tool task started via start_tool. Returns running/ready/failed plus the result when ready. Use it after you have already replied to the user and want the deferred result.", {
+    ("check_tool", check_tool, "Instant status check for a background task started via start_tool. No waiting. A ready, not-yet-delivered result is claimed and returned once; an already delivered/claimed result is reported without repeating it.", {
         "type": "object",
         "properties": {
             "task_id": {"type": "string", "description": "Task id returned by start_tool"},
-            "wait_seconds": {"type": "number", "description": "How long to wait for completion before returning (default: 0 — instant peek, max 30)"},
-            "consume": {"type": "boolean", "description": "Remove the task after reading a ready result (default: false — the result is also delivered to the queue automatically)"},
         },
         "required": ["task_id"],
     }),
-    ("list_tool_tasks", list_tool_tasks, "List background tool tasks (fire-and-forget) with their status: what is still running and what is ready.", {
+    ("list_tool_tasks", list_tool_tasks, "List background tool tasks belonging to the current voice session, with status and delivery state.", {
         "type": "object",
         "properties": {},
     }),

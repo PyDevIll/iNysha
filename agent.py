@@ -13,6 +13,7 @@ from loguru import logger
 
 from context_manager import ContextPool, count_tokens, repair_tool_sequence
 from server import config as app_config
+from server.context import is_voice_context
 from tool_registry import get_registry
 
 LLM_MAX_OUTPUT_TOKENS = app_config.LLM_MAX_OUTPUT_TOKENS
@@ -182,9 +183,36 @@ class Agent:
         """Execute one tool call and return the result message."""
         func_name = tool_call.function.name
         registry = get_registry()   # always live
-        logger.debug(f"_execute_single_tool: '{func_name}' | registry v{registry._version} | tools: {len(registry._tools)}")
-        if func_name not in registry._tools:
-            logger.error(f"_execute_single_tool: '{func_name}' NOT in registry._tools! Available: {sorted(registry._tools.keys())}")
+        voice_mode = is_voice_context()
+        logger.debug(
+            f"_execute_single_tool: '{func_name}' | voice={voice_mode} | "
+            f"registry v{registry._version} | tools: {len(registry.tool_names)}"
+        )
+        if registry.get_tool(func_name) is None:
+            logger.error(
+                f"_execute_single_tool: '{func_name}' NOT registered! "
+                f"Available: {sorted(registry.tool_names)}"
+            )
+        elif not registry.is_tool_allowed(func_name, voice_mode=voice_mode):
+            if voice_mode:
+                hint = (
+                    "This tool is not available for direct calls in a voice "
+                    "turn. Use start_tool to run it in the background and keep "
+                    "talking."
+                )
+            else:
+                hint = (
+                    "This helper is available only during voice turns; call "
+                    "the tool directly in a text turn."
+                )
+            logger.info(f"Tool policy rejected direct '{func_name}' (voice={voice_mode})")
+            return {
+                "tool_call_id": tool_call.id,
+                "role": "tool",
+                "name": func_name,
+                "content": f"Error: {hint}",
+            }
+
         try:
             args = json.loads(tool_call.function.arguments)
         except json.JSONDecodeError as e:
@@ -272,11 +300,9 @@ class Agent:
 
     @staticmethod
     def _is_voice_turn() -> bool:
-        """True when the current request comes from a voice client."""
+        """True for a voice turn, including its deferred tool-result turns."""
         try:
-            from server.context import get_request_context
-            ctx = get_request_context()
-            return bool(ctx and str(ctx.source).startswith("voice"))
+            return is_voice_context()
         except Exception:
             return False
 

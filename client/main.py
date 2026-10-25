@@ -409,6 +409,9 @@ class DesktopClient:
             elif status == "llm":
                 print("… думаю" + " " * 20)
             elif status == "tts":
+                # Covers both foreground and scheduled background speech;
+                # the following ``done`` restores the mic gate.
+                self.mic_muted = True
                 print("… говорю" + " " * 20)
             elif status == "no_speech":
                 print("Не расслышал." + " " * 20)

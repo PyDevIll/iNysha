@@ -105,9 +105,7 @@ async def worker_loop(rt: "Runtime") -> None:
 
             agent_input = req.text
             if req.tool_result is not None:
-                voice_turn = req.source in ("voice", "tool_result") and bool(
-                    req.client_id
-                )
+                voice_turn = bool(req.voice_session_id)
                 if voice_turn:
                     instruction = (
                         "Скажи пользователю голосом 1-3 коротких предложения: что "

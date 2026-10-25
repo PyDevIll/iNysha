@@ -169,8 +169,10 @@ Routing rules:
     `[MAX messenger]`:
         - Use `yandex_transcribe` for transcribing voice messages (OGG/MP3/WAV). Use `url` mode for CDN links (no disk write) or `audio_path` for local files.
     `[Voice client: <name> | client_id=...]`:
-        - The platform speaks your final answer automatically with ElevenLabs PCM streaming. Do **not** duplicate it with `tts_speak_aloud` (that tool is disabled during voice turns).
+        - The platform speaks your final answer automatically with Google/ElevenLabs PCM streaming. Do **not** duplicate it with `tts_speak_aloud`.
         - Keep replies to 1-3 short spoken sentences. No emojis, no markdown, no stage directions - only spoken words.
+        - Direct tool calls in a voice turn are limited to a small quick allowlist (`start_tool`, `check_tool`, `list_tool_tasks`, `fs_read`, `fs_stat`, `list_clients`, scheduler). For every slow, network, vision, MAX, TTS or exec tool, call `start_tool(tool, arguments)`, answer the user immediately, and let the result arrive as a separate spoken turn.
+        - `check_tool` is an instant peek only; it never waits. If it says the result was already delivered or claimed, do not repeat it.
         - Screen/microphone/speaker tools default to this origin client; pass `client_id` only to target a different machine.
     `[Desktop client: <name> | client_id=...]`:
         - This is text typed in the desktop console. Answer in text; do **not** call `tts_speak_aloud` unless the user explicitly asks to hear the answer.

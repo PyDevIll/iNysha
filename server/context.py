@@ -32,3 +32,15 @@ current_request: ContextVar[RequestContext | None] = ContextVar(
 
 def get_request_context() -> RequestContext | None:
     return current_request.get()
+
+
+def is_voice_context() -> bool:
+    """True for a real voice turn or a deferred result for that voice session.
+
+    ``source`` alone is not enough: background tool results arrive as
+    ``source="tool_result"`` but still belong to a voice session.  The
+    ``voice_session_id`` is set only by ``VoiceSession`` and travels through
+    ``Request``/``RequestContext``, so it is the authoritative marker.
+    """
+    ctx = current_request.get()
+    return bool(ctx and ctx.voice_session_id)

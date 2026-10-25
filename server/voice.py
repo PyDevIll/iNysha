@@ -209,6 +209,39 @@ class VoiceHub:
         )
         return ok
 
+    async def send_spoken_async(
+        self,
+        client_id: str | None = None,
+        text: str = "",
+        *,
+        session_id: str | None = None,
+    ) -> bool:
+        """Schedule speech and return without waiting for TTS/playback.
+
+        Used by background tool results so the shared worker is not held for
+        the duration of a spoken answer.  The session serializes utterances
+        and, when a foreground turn is active, waits for it to finish first.
+        """
+        session = self.resolve(client_id, session_id=session_id)
+        target = session_id or client_id or "<any>"
+        if session is None:
+            logger.info(f"voice hub: no live session for {target}, mute")
+            return False
+        if not (text or "").strip():
+            logger.info(
+                f"voice hub: session {session.session_id} stays silent "
+                "(empty answer)"
+            )
+            return False
+        task = session.schedule_speech(text, source="background")
+        if task is None:
+            return False
+        logger.info(
+            f"voice hub: session {session.session_id} speech scheduled "
+            "(background, non-blocking)"
+        )
+        return True
+
     async def wait_idle(
         self,
         client_id: str | None = None,
@@ -280,6 +313,12 @@ class VoiceSession:
         # and background speech both go through ``speak``, so they cannot
         # interleave PCM in one socket.
         self.playback_lock = asyncio.Lock()
+        self._speech_tasks: set[asyncio.Task] = set()
+        # Set while a full user turn (agent + foreground TTS) is active.
+        # Background results wait for this before speaking, so they cannot
+        # overtake the answer to the current question.
+        self._turn_idle = asyncio.Event()
+        self._turn_idle.set()
         self.segmenter = VadSegmenter(
             aggressiveness=2,
             preroll_ms=400,
@@ -333,6 +372,7 @@ class VoiceSession:
         self.accept_audio = False
         self.hub.unregister(self)
         await self._cancel_turn()
+        await self._cancel_speech()
         logger.info(
             f"voice session {self.session_id} disconnected: "
             f"{self.client_id!r} ({self.name})"
@@ -345,6 +385,13 @@ class VoiceSession:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
+    async def _cancel_speech(self) -> None:
+        tasks = list(self._speech_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _receive_loop(self) -> None:
         while True:
@@ -397,6 +444,7 @@ class VoiceSession:
         if action == "listen_start":
             self.session_open = True
             await self._cancel_turn()
+            await self._cancel_speech()
             self.segmenter.reset()
             self.accept_audio = True
             logger.debug(f"voice {self.session_id}: listening")
@@ -406,6 +454,7 @@ class VoiceSession:
             self.accept_audio = False
             self.segmenter.reset()
             await self._cancel_turn()
+            await self._cancel_speech()
             logger.debug(f"voice {self.session_id}: stopped")
 
         elif action == "playback_done":
@@ -419,6 +468,14 @@ class VoiceSession:
                 )
 
     async def _run_turn(self, pcm: bytes) -> None:
+        """Run one foreground turn and mark the session busy until TTS ends."""
+        self._turn_idle.clear()
+        try:
+            await self._run_turn_inner(pcm)
+        finally:
+            self._turn_idle.set()
+
+    async def _run_turn_inner(self, pcm: bytes) -> None:
         """STT -> shared agent queue -> streaming TTS."""
         started = time.time()
         try:
@@ -523,13 +580,20 @@ class VoiceSession:
                     {"type": "done", "elapsed": time.time() - started}
                 )
 
-    async def speak(self, text: str, *, source: str = "background") -> bool:
+    async def speak(
+        self,
+        text: str,
+        *,
+        source: str = "background",
+        notify_done: bool = False,
+    ) -> bool:
         """Synthesize and stream one utterance to this session.
 
         The playback lock is held for the whole utterance, so foreground and
         background turns cannot interleave.  It covers socket sending, not
         real speaker playback: the browser's ``playback_done`` remains an
-        advisory signal for microphone re-enable.
+        advisory signal for microphone re-enable.  ``notify_done`` is used by
+        scheduled background speech so the client can restore its mic gate.
         """
         speech = sanitize_for_tts(text or "")
         if not speech:
@@ -570,6 +634,11 @@ class VoiceSession:
                     await self.send_json(
                         {"type": "error", "message": "voice TTS failed"}
                     )
+                if notify_done:
+                    with suppress(Exception):
+                        await self.send_json(
+                            {"type": "done", "elapsed": time.time() - started}
+                        )
                 return False
 
             logger.info(
@@ -578,7 +647,48 @@ class VoiceSession:
                 f"pieces={pieces_seen if self.tts_backend == 'google' else 1}, "
                 f"{bytes_sent} bytes PCM, {time.time() - started:.1f}s"
             )
+            if notify_done:
+                with suppress(Exception):
+                    await self.send_json(
+                        {"type": "done", "elapsed": time.time() - started}
+                    )
             return True
+
+    def schedule_speech(
+        self, text: str, *, source: str = "background"
+    ) -> asyncio.Task | None:
+        """Schedule speech without blocking the caller.
+
+        The task waits for the current foreground turn to finish, then calls
+        ``speak`` and is serialized by ``playback_lock`` with other speech.
+        A strong reference is kept until completion.
+        """
+        if self._closed or not self.session_open or not (text or "").strip():
+            return None
+
+        async def _run() -> None:
+            await self._turn_idle.wait()
+            if self._closed or not self.session_open:
+                return
+            await self.speak(text, source=source, notify_done=True)
+
+        task = asyncio.create_task(
+            _run(), name=f"voice-speech-{self.session_id}"
+        )
+        self._speech_tasks.add(task)
+
+        def _done(done_task: asyncio.Task) -> None:
+            self._speech_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error(
+                    f"voice {self.session_id}: scheduled speech failed: {exc}"
+                )
+
+        task.add_done_callback(_done)
+        return task
 
     async def wait_idle(self, timeout: float = 30.0) -> None:
         """Wait until this session is not sending a TTS utterance."""

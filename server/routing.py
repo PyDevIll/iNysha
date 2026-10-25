@@ -86,7 +86,12 @@ class VoiceReply:
         self.session_id = session_id
 
     async def send_text(self, text: str) -> None:
-        sender = getattr(self.hub, "send_spoken", None)
+        # Prefer the non-blocking variant so background result turns do not
+        # occupy the shared worker for the duration of TTS/playback.  Keep the
+        # old method as a fallback for lightweight hubs/tests.
+        sender = getattr(self.hub, "send_spoken_async", None)
+        if sender is None:
+            sender = getattr(self.hub, "send_spoken", None)
         if sender is None:
             logger.warning(
                 f"[VoiceReply] {self.client_id}: no send_spoken in hub, "
