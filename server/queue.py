@@ -18,6 +18,9 @@ class Request:
     source: str = "unknown"
     chat_id: str | None = None
     client_id: str | None = None
+    # Exact voice WebSocket session that originated a voice/tool-result turn.
+    # ``client_id`` alone is ambiguous when one client has multiple sessions.
+    voice_session_id: str | None = None
     trusted: bool = False
     send_reasoning: bool = False
     # Set for background tool results delivered as a separate agent turn.

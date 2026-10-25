@@ -312,6 +312,7 @@ async def _deliver_tool_result(task: dict, tid: str) -> None:
 
     chat_id = task.get("chat_id")
     client_id = task.get("client_id")
+    voice_session_id = task.get("voice_session_id")
     reply = NullReply()
     if chat_id and getattr(rt, "bot", None) is not None:
         try:
@@ -325,8 +326,16 @@ async def _deliver_tool_result(task: dict, tid: str) -> None:
             from server.voice import voice_hub
             # Не наезжаем на текущую реплику: ждём, пока пользователь
             # дослушает её, потом говорим.
-            await voice_hub.wait_idle(str(client_id), timeout=20.0)
-            reply = VoiceReply(voice_hub, str(client_id))
+            await voice_hub.wait_idle(
+                str(client_id),
+                timeout=20.0,
+                session_id=voice_session_id,
+            )
+            reply = VoiceReply(
+                voice_hub,
+                str(client_id),
+                session_id=voice_session_id,
+            )
         except Exception as e:
             logger.info(f"voice reply unavailable for {client_id}: {e}")
             reply = NullReply()
@@ -337,6 +346,7 @@ async def _deliver_tool_result(task: dict, tid: str) -> None:
         source="tool_result",
         chat_id=chat_id,
         client_id=client_id,
+        voice_session_id=voice_session_id,
         trusted=True,
         tool_result=str(payload),
         tool_task_id=tid,
@@ -412,6 +422,7 @@ async def start_tool(tool: str, arguments: str = "{}", delay_seconds: float = 0)
         # where the finished result should be delivered
         "chat_id": getattr(ctx, "chat_id", None),
         "client_id": getattr(ctx, "client_id", None),
+        "voice_session_id": getattr(ctx, "voice_session_id", None),
         "source": getattr(ctx, "source", None),
         "auto_deliver": True,
     }

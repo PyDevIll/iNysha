@@ -22,7 +22,7 @@ processed strictly one at a time, so all interactions share one context.
 | * | `server/routing.py`                  | Reply targets: MAX chat, HTTP future, null |
 | * | `server/audio.py`                    | PCM/WAV, RMS, Groq Whisper transcription, TTS text cleanup |
 | * | `server/clients.py`                  | Desktop control WebSocket hub (`/ws/client`), auth, RPC futures |
-| * | `server/voice.py`                    | Desktop voice WebSocket (`/ws/voice`): VAD, STT, agent queue, TTS |
+| * | `server/voice.py`                    | Voice WebSockets (`/ws/voice`, `/ws/web-voice`): `VoiceSession`, VAD, STT, agent queue, TTS |
 | * | `server/remote_tools.py`              | Client tool layer: screenshot, screen sequence, mic, speakers, notify |
 | * | `server/vad.py`                      | WebRTC VAD utterance segmentation |
 | * | `server/sources/max.py`              | MAX webhook: parse/download/transcribe -> queue |
@@ -150,7 +150,7 @@ ToolRegistry.list_tools()        # Returns a human-readable string
 - **Tools**: Hot-reload tool system via `reload_tools`. New tools loaded without restart.
 - **Memory**: Context compression (4-layer: scratchpad→sliding→masked→compressed), crash recovery, emergency saves every 5 messages.
 - **MAX messenger**: Webhook-driven (Yandex Cloud Function -> `/max-webhook`). Each chat's updates are queued; the final answer is delivered automatically to the originating chat. Reasoning can go to a separate chat. File transfer via `max_send_file` (FS→messenger) and `max_download_file` (Messenger→FS). Incoming documents/photos auto-download to `data/downloads/`; voice messages are transcribed with Groq Whisper.
-- **Voice**: Groq Whisper STT (Russian) and ElevenLabs TTS (PCM 16 kHz) for connected desktop clients; MAX voice messages in/out.
+- **Voice**: independent `VoiceSession` per WebSocket for desktop and browser clients; Groq Whisper STT (Russian) and Google TTS / ElevenLabs (PCM 16 kHz); replies route to the originating `session_id`; MAX voice messages in/out.
 - **Git**: Observation of local repository — status, log, diff.
 
 ## **RULES**

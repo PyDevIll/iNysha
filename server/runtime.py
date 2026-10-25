@@ -86,6 +86,7 @@ async def worker_loop(rt: "Runtime") -> None:
             source=req.source,
             chat_id=req.chat_id,
             client_id=req.client_id,
+            voice_session_id=req.voice_session_id,
             trusted=req.trusted,
         )
         token = current_request.set(ctx)

@@ -70,18 +70,29 @@ class VoiceReply:
     говорить ли вслух — если ``send_text`` получил пустую строку, звука нет.
     """
 
-    def __init__(self, voice_hub: Any, client_id: str) -> None:
+    def __init__(
+        self,
+        voice_hub: Any,
+        client_id: str,
+        session_id: str | None = None,
+    ) -> None:
         self.hub = voice_hub
         self.client_id = client_id
+        self.session_id = session_id
 
     async def send_text(self, text: str) -> None:
         sender = getattr(self.hub, "send_spoken", None)
         if sender is None:
             logger.warning(
-                f"[VoiceReply] {self.client_id}: no send_spoken in hub, dropping answer"
+                f"[VoiceReply] {self.client_id}: no send_spoken in hub, "
+                "dropping answer"
             )
             return
-        await sender(self.client_id, text or "")
+        await sender(
+            self.client_id,
+            text or "",
+            session_id=self.session_id,
+        )
 
     async def send_error(self, text: str) -> None:
         await self.send_text(text)

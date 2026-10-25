@@ -17,6 +17,7 @@ class RequestContext:
     source: str
     chat_id: str | None = None
     client_id: str | None = None
+    voice_session_id: str | None = None
     trusted: bool = False
     # Chats already messaged by a tool during this turn (avoids double replies).
     sent_chats: set[str] = field(default_factory=set)
