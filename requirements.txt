@@ -22,3 +22,7 @@ elevenlabs==2.69.0
 
 # Google Translate TTS: конвертация MP3 -> PCM 16 кГц (ffmpeg в комплекте)
 imageio-ffmpeg
+
+# Долговременная память (SQLite встроен в Python): лемматизация русского для FTS5
+pymorphy3~=2.0.6
+pymorphy3-dicts-ru~=2.4

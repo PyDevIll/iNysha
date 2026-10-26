@@ -87,6 +87,20 @@ SCHEDULER_TASKS_FILE = _env_path(
 )
 MAX_MARKER_FILE = _env_path("MAX_MARKER_FILE", DATA_DIR / "max_marker.json")
 
+# ── Long-term memory (SQLite graph) ────────────────────────────────────
+# MEMORY_BACKEND selects the read path for the prompt's memory block:
+#   "json"   — today's behaviour: persistent_memory.json rendered in full;
+#   "sqlite" — relevant selection from memory.db (still opt-in).
+# The database itself is always created lazily by server.memory_store, so an
+# empty MEMORY_DB_PATH directory is harmless and nothing is written on import.
+MEMORY_BACKEND = _env_str("MEMORY_BACKEND", "json").strip().lower() or "json"
+MEMORY_DB_PATH = _env_path("MEMORY_DB_PATH", DATA_DIR / "memory.db")
+# Hard cap for the injected block, in tokens (not bytes): 1 KB of Cyrillic is
+# only ~150-200 tokens, which made the byte budget in the draft misleading.
+MEMORY_BLOCK_TOKENS = int(os.getenv("MEMORY_BLOCK_TOKENS", "400"))
+MEMORY_BLOCK_MAX_ITEMS = int(os.getenv("MEMORY_BLOCK_MAX_ITEMS", "8"))
+MEMORY_ITEM_TOKENS = int(os.getenv("MEMORY_ITEM_TOKENS", "60"))
+
 STATIC_DIR = _env_path("STATIC_DIR", ROOT / "static")
 VOICE_STATIC_DIR = _env_path("VOICE_STATIC_DIR", STATIC_DIR / "voice")
 PROMPTS_DIR = _env_path("PROMPTS_DIR", ROOT / "system_prompts")
@@ -224,5 +238,6 @@ def ensure_dirs() -> None:
         LOG_FILE.parent,
         SCHEDULER_TASKS_FILE.parent,
         MAX_MARKER_FILE.parent,
+        MEMORY_DB_PATH.parent,
     ):
         path.mkdir(parents=True, exist_ok=True)
