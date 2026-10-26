@@ -98,6 +98,30 @@ def tokenize(text: str) -> list[str]:
     return normalized.split() if normalized else []
 
 
+# Russian morphology cannot bridge a synonym gap: "таймаут" is a lemma of its
+# own, while the transcript says "timeout"; "перезагрузить" and "перезапуск"
+# share no stem.  A tiny hand-curated map buys those cases for free and is
+# measured by scripts/memory_eval.py --golden.  Keep it short: every entry
+# widens recall and can only dilute precision, so add only proven misses.
+SYNONYMS: dict[str, tuple[str, ...]] = {
+    "таймаут": ("timeout",),
+    "перезагрузка": ("перезапуск", "рестарт", "restart"),
+    "перезагрузить": ("перезапустить", "рестарт", "restart"),
+    "перезапуск": ("рестарт", "restart", "systemctl"),
+    "перезапустить": ("рестарт", "restart", "systemctl"),
+    "мах": ("max",),
+    "макс": ("max",),
+    "мессенджер": ("max",),
+    "озвучка": ("tts", "голос"),
+    "распознавание": ("whisper", "транскрипция"),
+}
+
+
+def expand_lemmas(token: str) -> tuple[str, ...]:
+    """The lemma plus its known synonyms (an FTS5 OR-group)."""
+    return (token, *SYNONYMS.get(token, ()))
+
+
 @lru_cache(maxsize=50_000)
 def lemma(word: str) -> str:
     """Lemma of one normalised word; the word itself if morphology is absent."""
@@ -145,8 +169,13 @@ def fts_query(text: str, prefix_len: int | None = None) -> str:
     for token in unique:
         if prefix_len and len(token) > prefix_len:
             parts.append(f'"{token[:prefix_len]}"*')
-        else:
+            continue
+        variants = expand_lemmas(token)
+        if len(variants) == 1:
             parts.append(f'"{token}"')
+        else:
+            group = " OR ".join(f'"{variant}"' for variant in variants)
+            parts.append(f"({group})")
     query = " OR ".join(parts)
     logger.trace(f"memory: fts_query tokens={len(unique)} prefix={prefix_len}")
     return query

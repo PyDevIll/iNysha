@@ -41,6 +41,8 @@ VOICE_DIRECT_TOOLS = frozenset({
     "schedule_task",
     "list_scheduled_tasks",
     "cancel_scheduled_task",
+    # Локальный SQLite/FTS5, ~1 мс, только чтение — не блокирует разговор.
+    "memory_search",
 })
 
 

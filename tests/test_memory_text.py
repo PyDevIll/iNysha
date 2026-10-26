@@ -105,6 +105,14 @@ class FtsQueryTest(unittest.TestCase):
         query = fts_query(" ".join(f"слово{i}" for i in range(200)))
         self.assertLessEqual(query.count('"'), 24 * 2)
 
+    def test_query_expands_known_synonyms(self) -> None:
+        # Морфология не спасёт «таймаут» → «timeout»; это делает словарь.
+        self.assertEqual(fts_query("таймаут"), '("таймаут" OR "timeout")')
+
+    def test_unknown_word_has_no_group(self) -> None:
+        # Лемматизация всё равно сработает, но без OR-группы синонимов.
+        self.assertEqual(fts_query("астрофизика"), '"астрофизик"')
+
     def test_query_survives_fts_syntax_in_user_text(self) -> None:
         # Раньше такой текст ронял MATCH; теперь он просто слова.
         conn = sqlite3.connect(":memory:")
