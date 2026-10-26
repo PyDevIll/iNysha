@@ -345,15 +345,20 @@ class FtsTriggerTest(StoreTestBase):
 
 
 class SingletonTest(StoreTestBase):
-    def test_get_store_returns_same_instance(self) -> None:
+    def test_get_store_is_cached_per_path(self) -> None:
         first = get_store(self.db_path)
-        second = get_store()
+        second = get_store(self.db_path)
         self.assertIs(first, second)
         self.assertEqual(first.path, self.db_path)
 
+    def test_different_paths_are_different_stores(self) -> None:
+        first = get_store(self.db_path)
+        other = get_store(self.data_dir / "other.db")
+        self.assertIsNot(first, other)
+
     def test_close_store_resets_singleton(self) -> None:
         first = get_store(self.db_path)
-        close_store()
+        close_store(self.db_path)
         second = get_store(self.db_path)
         self.assertIsNot(first, second)
 

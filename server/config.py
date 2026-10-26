@@ -110,6 +110,14 @@ MEMORY_PROFILE_TOKENS = int(os.getenv("MEMORY_PROFILE_TOKENS", "700"))
 MEMORY_LOG_FILE = _env_path("MEMORY_LOG_FILE", DATA_DIR / "memory.log")
 MEMORY_LOG_LEVEL = _env_str("MEMORY_LOG_LEVEL", "DEBUG")
 
+# Episodes are the searchable transcript.  They are written from the same hook
+# that already appends message_history.md, so there is only one transcript.
+# Set MEMORY_WRITE_EPISODES=0 to stop writing (the DB stays untouched).
+MEMORY_WRITE_EPISODES = _env_str("MEMORY_WRITE_EPISODES", "1") not in ("0", "false", "no")
+# Tool results are recoverable from message_history.md and would flood the
+# episode table (they can be tens of KB each), so they are off by default.
+MEMORY_EPISODE_TOOLS = _env_str("MEMORY_EPISODE_TOOLS", "0") in ("1", "true", "yes")
+
 STATIC_DIR = _env_path("STATIC_DIR", ROOT / "static")
 VOICE_STATIC_DIR = _env_path("VOICE_STATIC_DIR", STATIC_DIR / "voice")
 PROMPTS_DIR = _env_path("PROMPTS_DIR", ROOT / "system_prompts")

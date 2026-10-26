@@ -15,6 +15,7 @@ A connection — and the database file itself — appears on first use, so the
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 import time
@@ -24,6 +25,7 @@ from typing import Optional
 from loguru import logger
 
 from server import config as app_config
+from server.memory_text import lemmatize
 
 SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MS = 3000
@@ -201,6 +203,15 @@ def now_ts() -> int:
     return int(time.time())
 
 
+def episode_hash(text: str) -> str:
+    """Stable, short fingerprint of one utterance.
+
+    Used by ``episodes.UNIQUE(chat_id, ts, speaker, hash)`` so that importing
+    (or re-importing) the same transcript cannot duplicate rows.
+    """
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:16]
+
+
 class MemoryStore:
     """One SQLite database, one connection, single writer.
 
@@ -336,6 +347,61 @@ class MemoryStore:
             self._schema_version = self._read_version(self.connection)
         return self._schema_version
 
+    # ── Episodes ───────────────────────────────────────────────────
+    def add_episode(
+        self,
+        *,
+        chat_id: str,
+        speaker: str,
+        kind: str,
+        ts: int,
+        text: str,
+        summary: Optional[str] = None,
+        ref: Optional[str] = None,
+        tone: Optional[str] = None,
+        scope: str = "shared",
+        commit: bool = True,
+    ) -> Optional[int]:
+        """Insert one utterance; return its id, or ``None`` if already known.
+
+        The unique key is ``(chat_id, ts, speaker, hash)``, so the same
+        transcript can be imported twice, or an in-flight turn can be replayed
+        after a crash, without duplicating rows.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        lemma_text = lemmatize(text)
+        if summary:
+            lemma_text = f"{lemma_text} {lemmatize(summary)}".strip()
+        try:
+            cur = self.connection.execute(
+                "INSERT OR IGNORE INTO episodes"
+                "(chat_id, scope, speaker, kind, ts, text, summary, ref, tone,"
+                " lemma_text, hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(chat_id), scope, speaker, kind, int(ts), text,
+                    summary, ref, tone, lemma_text, episode_hash(text),
+                ),
+            )
+            if commit:
+                self.connection.commit()
+        except sqlite3.Error as e:
+            # Memory is an add-on: a broken DB must never break a turn.
+            logger.warning(f"memory: episode insert failed: {e}")
+            return None
+        if not cur.rowcount:
+            logger.debug(
+                f"memory: episode already stored chat={chat_id} "
+                f"ts={ts} speaker={speaker} chars={len(text)}"
+            )
+            return None
+        logger.debug(
+            f"memory: episode stored id={cur.lastrowid} chat={chat_id} "
+            f"speaker={speaker} kind={kind} ts={ts} chars={len(text)}"
+        )
+        return int(cur.lastrowid) if cur.lastrowid else None
+
     # ── Diagnostics ────────────────────────────────────────────────
     def stats(self) -> dict[str, int]:
         """Row counts per table — cheap enough for a health endpoint."""
@@ -359,26 +425,34 @@ class MemoryStore:
         return ok
 
 
-# ── Process-wide singleton ─────────────────────────────────────────────
-_store: Optional[MemoryStore] = None
+# ── Process-wide store registry ────────────────────────────────────────
+# One connection per database file. Keying by path keeps tests hermetic: a
+# ContextPool pointed at a tmp dir never shares the live data/memory.db, yet
+# tools and the episode log still land on the same connection.
+_stores: dict[Path, MemoryStore] = {}
 _store_lock = threading.Lock()
 
 
 def get_store(path: Path | str | None = None) -> MemoryStore:
-    """Return the shared store, opening ``path`` (or MEMORY_DB_PATH) on demand."""
-    global _store
-    if _store is not None:
-        return _store
+    """Return the shared store for ``path`` (default MEMORY_DB_PATH)."""
+    resolved = Path(path or app_config.MEMORY_DB_PATH).expanduser().resolve()
     with _store_lock:
-        if _store is None:
-            _store = MemoryStore(path or app_config.MEMORY_DB_PATH)
-    return _store
+        store = _stores.get(resolved)
+        if store is None:
+            store = MemoryStore(resolved)
+            _stores[resolved] = store
+        return store
 
 
-def close_store() -> None:
-    """Close and forget the shared store (shutdown, tests)."""
-    global _store
+def close_store(path: Path | str | None = None) -> None:
+    """Close one store, or every open store when ``path`` is omitted."""
     with _store_lock:
-        if _store is not None:
-            _store.close()
-            _store = None
+        if path is None:
+            items = list(_stores.items())
+            _stores.clear()
+        else:
+            resolved = Path(path).expanduser().resolve()
+            store = _stores.pop(resolved, None)
+            items = [(resolved, store)] if store is not None else []
+    for _resolved, store in items:
+        store.close()

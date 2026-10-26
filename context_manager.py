@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from server import config as app_config
+from server.memory_episodes import EpisodeLog
 from server.memory_text import preview
 
 import tiktoken
@@ -508,6 +509,7 @@ class ContextPool:
         # Infrastructure
         self._masker = ObservationMasker()
         self._persistent = PersistentStore(self._data_dir)
+        self._episodes = EpisodeLog(self._data_dir)
         self._save_counter: int = 0
         self.overflow: bool = False
         self.base_prompt_tokens: int = 0   # static system+base prompt cost (set by Agent)
@@ -628,6 +630,7 @@ class ContextPool:
 
         if save:
             self._save_to_file(entry)
+            self._episodes.record(entry)
 
         self._check_overflow()
         self._auto_mask()
@@ -650,6 +653,7 @@ class ContextPool:
 
         if save:
             self._save_to_file(entry)
+            self._episodes.record(entry)
 
         self._check_overflow()
         self._auto_mask()
