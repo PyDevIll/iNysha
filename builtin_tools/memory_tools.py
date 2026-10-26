@@ -61,12 +61,18 @@ async def memory_remember(
     name: str,
     text: str,
     scope: str = "shared",
+    source: str = "",
 ) -> str:
     """Remember one fact on purpose (survives restarts, comes back into context).
 
     Use only when the user says to remember something, or when a durable fact
     is clearly established. Never store secrets: keep where the key lives, not
     the key. Never store jokes or your own sarcasm as facts.
+
+    If the fact comes from a file or a web page, pass ``source`` with the exact
+    path/URL you read with a tool: the server checks that you really read it,
+    and the fact is marked as external (lower confidence, source shown in the
+    prompt). An invented source is refused.
     """
     trusted, chat_id = current_trust()
     try:
@@ -78,15 +84,19 @@ async def memory_remember(
             scope=scope,
             trusted=trusted,
             chat_id=chat_id,
+            source=source or None,
         )
     except MemoryWriteError as e:
         logger.info(f"memory_remember rejected: {e}")
         return f"Не записано: {e}"
     verdict = "Запомнила" if result.created else "Обновила"
-    origin = "оператор" if trusted else "сказано мной"
+    origin = "оператор" if trusted else ("сказано мной")
+    if result.source_label:
+        origin = result.source_label.strip("[]")
     logger.info(
         f"memory_remember: {verdict} [{result.kind}] {result.name!r} "
-        f"id={result.node_id} scope={result.scope} ({origin})"
+        f"id={result.node_id} scope={result.scope} origin={result.origin} "
+        f"({origin})"
     )
     return (
         f"{verdict}: [{result.kind}] {result.name} "
@@ -170,6 +180,12 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "enum": ["shared", "chat"],
                     "description": "shared — для всех чатов, chat — только текущий",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Точный путь или URL, который ты прочитал инструментом "
+                                   "(fs_read, tavily_browse и т.п.). Обязателен для фактов "
+                                   "из файлов и страниц: выдуманный источник отклоняется.",
                 },
             },
             "required": ["kind", "name", "text"],

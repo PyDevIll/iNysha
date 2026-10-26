@@ -13,6 +13,7 @@ Three constraints shape this module (see ``data/memory_schema_draft.md``):
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -23,6 +24,7 @@ from server import config as app_config
 from server.memory_search import NodeHit, EpisodeHit, search_episodes, search_nodes
 from server.memory_store import MemoryStore
 from server.memory_text import preview
+from server.read_sources import label as source_label
 
 HEADER = "## Из памяти"
 _MAX_ITEMS = None  # бюджет в токенах решает; количество — производное
@@ -48,10 +50,39 @@ def _cost(text: str) -> int:
     return max(1, len(text) // 3)
 
 
+def _node_is_current(node: NodeHit) -> bool:
+    """Hide a fact whose source file changed after it was read.
+
+    Nothing is written to the DB here: the block build stays read-only and
+    fast. A maintenance pass can mark such nodes ``stale`` later; meanwhile the
+    agent simply does not see a fact that may already be wrong.
+    """
+    if node.origin != "tool" or not node.source:
+        return True
+    ref = node.source.get("ref")
+    # Nanoseconds: an edit inside the same second is still a real edit.
+    stored_mtime = node.source.get("mtime")
+    if not ref or stored_mtime is None:
+        return True
+    try:
+        actual = int(os.stat(ref).st_mtime_ns)
+    except OSError:
+        logger.warning(f"memory: source file gone, hiding node id={node.id} ref={ref}")
+        return False
+    if actual != int(stored_mtime):
+        logger.warning(
+            f"memory: source file changed, hiding node id={node.id} "
+            f"ref={ref} (stored mtime={stored_mtime}, now={actual})"
+        )
+        return False
+    return True
+
+
 def render_block(
     nodes: list[NodeHit],
     episodes: list[EpisodeHit],
     budget_tokens: int,
+    external_limit: Optional[int] = None,
 ) -> str:
     """Render selected memory within ``budget_tokens``; empty when nothing fits."""
     if not nodes and not episodes:
@@ -71,9 +102,26 @@ def render_block(
     if nodes:
         lines.append("Факты:")
         used += _cost("Факты:")
+        limit = (app_config.MEMORY_BLOCK_EXTERNAL_ITEMS
+                 if external_limit is None else external_limit)
+        external_used = 0
         for node in nodes:
-            if not add(f"- [{node.kind}] {node.name}: {preview(node.text, 180)}"):
+            # A fact about a file that changed since is worse than no fact.
+            if not _node_is_current(node):
+                continue
+            external = node.origin in ("web", "tool")
+            if external and external_used >= limit:
+                # Operator's own facts always win the scarce block space.
+                continue
+            suffix = ""
+            if external and node.source:
+                suffix = f" {source_label(node.source)}"
+            if not add(
+                f"- [{node.kind}] {node.name}: {preview(node.text, 180)}{suffix}"
+            ):
                 break
+            if external:
+                external_used += 1
     if episodes:
         lines.append("Из истории:")
         used += _cost("Из истории:")

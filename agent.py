@@ -13,7 +13,7 @@ from loguru import logger
 
 from context_manager import ContextPool, count_tokens, repair_tool_sequence
 from server import config as app_config
-from server import memory_context
+from server import memory_context, read_sources as memory_sources
 from server.context import get_request_context, is_voice_context
 from server.memory_context import TurnMemory
 from server.memory_store import get_store
@@ -243,6 +243,20 @@ class Agent:
                 "content": f"Error: tool '{func_name}' timed out (>120s). "
                            f"Try narrowing the search scope.",
             }
+
+        # Provenance: a fact may only cite a file or URL a tool actually
+        # returned. Best effort — a broken sources table must never fail a tool.
+        try:
+            context = get_request_context()
+            memory_sources.record_tool_read(
+                get_store(),
+                func_name,
+                args if isinstance(args, dict) else {},
+                result,
+                chat_id=context.chat_id if context else None,
+            )
+        except Exception as e:
+            logger.debug(f"memory: source recording skipped for {func_name}: {e}")
 
         return {
             "tool_call_id": tool_call.id,

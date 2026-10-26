@@ -21,14 +21,24 @@ from typing import Optional
 
 from loguru import logger
 
+from server import config as app_config
 from server.context import get_request_context
 from server.memory_store import MemoryStore, now_ts
 from server.memory_text import normalize_name
+from server.read_sources import label as source_label
+from server.read_sources import resolve_source
 
 NODE_KINDS = (
     "person", "project", "server", "rule", "fact", "topic", "document",
 )
 MAX_TEXT_CHARS = 2000
+
+# Instructions aimed at the agent, not facts about the world. Only enforced for
+# web/tool-sourced writes: an operator legitimately says "удали старый файл".
+_INSTRUCTION_RE = re.compile(
+    r"(?i)\b(игнорируй|проигнорируй|выполни|не\s+сообщай|не\s+говори|"
+    r"ты\s+должен|system\s+prompt|системн\w*\s+промпт|инструкци\w*)\b"
+)
 
 # Known credential shapes. Conservative on purpose: a false positive costs one
 # rejected memory entry, a false negative leaks a key into every future prompt.
@@ -66,6 +76,8 @@ class RememberResult:
     kind: str
     name: str
     scope: str
+    origin: str = "agent"
+    source_label: str = ""
 
 
 class MemoryWriteError(ValueError):
@@ -83,6 +95,7 @@ def remember(
     chat_id: Optional[str] = None,
     confidence: Optional[float] = None,
     origin: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> RememberResult:
     kind = (kind or "").strip().lower()
     if kind not in NODE_KINDS:
@@ -114,6 +127,30 @@ def remember(
             "и место, где лежит ключ, а не сам ключ."
         )
 
+    source_info: Optional[dict] = None
+    if source:
+        source_info = resolve_source(store, str(source))
+        if source_info is None:
+            logger.info(
+                f"memory: rejected unread source name={name!r} "
+                f"source={str(source)[:80]!r}"
+            )
+            raise MemoryWriteError(
+                "Этот источник не найден среди прочитанного за последние "
+                f"{app_config.MEMORY_SOURCE_WINDOW_DAYS} дней. Укажи точный путь "
+                "или URL из результата инструмента — выдуманный источник "
+                "память не принимает."
+            )
+        if _INSTRUCTION_RE.search(text):
+            logger.warning(
+                f"memory: rejected instruction-like fact from {source_info['kind']} "
+                f"name={name!r}"
+            )
+            raise MemoryWriteError(
+                "Похоже на инструкцию из внешнего источника, а не на факт. "
+                "Такое в память не пишем."
+            )
+
     scope = (scope or "shared").strip()
     if scope not in ("shared", "chat"):
         raise MemoryWriteError("scope: 'shared' или 'chat'.")
@@ -123,18 +160,25 @@ def remember(
     if scope == "chat":
         resolved_scope = f"chat:{chat_id}" if chat_id else "shared"
 
-    origin = origin or ("operator" if trusted else "agent")
+    if source_info is not None:
+        # Where the fact came from is derived, never self-reported; confidence
+        # stays lower than a fact the operator vouched for.
+        origin = "web" if source_info["kind"] == "web" else "tool"
+    else:
+        origin = origin or ("operator" if trusted else "agent")
     if origin not in ("operator", "agent", "web", "tool", "import"):
         raise MemoryWriteError(
             "origin: operator, agent, web, tool или import."
         )
     if confidence is None:
         confidence = 0.9 if trusted else 0.6
+    if source_info is not None and not trusted:
+        confidence = min(confidence, 0.7)
 
     payload = json.dumps(
         {
             "text": text,
-            "source": "explicit",
+            "source": source_info or "explicit",
             "chat_id": chat_id,
             "written_at": now_ts(),
         },
@@ -150,11 +194,15 @@ def remember(
         origin=origin,
         confidence=confidence,
     )
+    label = source_label(source_info)
     logger.info(
         f"memory: {'created' if created else 'updated'} node id={node_id} "
-        f"kind={kind} name={name!r} scope={resolved_scope} origin={origin}"
+        f"kind={kind} name={name!r} scope={resolved_scope} origin={origin} "
+        f"confidence={confidence:.2f} source={label or 'explicit'}"
     )
-    return RememberResult(node_id, created, kind, name, resolved_scope)
+    return RememberResult(
+        node_id, created, kind, name, resolved_scope, origin, label
+    )
 
 
 def forget(

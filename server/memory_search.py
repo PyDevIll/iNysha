@@ -153,20 +153,27 @@ class NodeHit:
     name: str
     text: str
     score: float
+    # Where the fact came from: provenance is what lets the block mark external
+    # knowledge and hide a fact whose file has changed since it was read.
+    origin: str = "agent"
+    source: Optional[dict] = None
 
     def as_line(self, index: int) -> str:
         return f"{index}. [{self.kind}] {self.name}: {preview(self.text, SNIPPET_CHARS)}"
 
 
-def _node_text(row) -> str:
-    """Node body: the ``text`` field of its JSON payload, else the raw data."""
+def _node_payload(row) -> dict:
     try:
         payload = json.loads(row["data"] or "{}")
-        if isinstance(payload, dict):
-            return str(payload.get("text") or payload.get("note") or "")
     except (ValueError, TypeError):
-        pass
-    return ""
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _node_text(row) -> str:
+    """Node body: the ``text`` field of its JSON payload, else the raw data."""
+    payload = _node_payload(row)
+    return str(payload.get("text") or payload.get("note") or "")
 
 
 def search_nodes(
@@ -192,12 +199,16 @@ def search_nodes(
             continue
         if scope is not None and row["scope"] not in (scope, "shared"):
             continue
+        payload = _node_payload(row)
+        source = payload.get("source")
         hits.append(NodeHit(
             id=int(row["id"]),
             kind=str(row["kind"]),
             name=str(row["name"]),
-            text=_node_text(row),
+            text=str(payload.get("text") or payload.get("note") or ""),
             score=-float(pair["score"]),
+            origin=str(row["origin"] or "agent"),
+            source=source if isinstance(source, dict) else None,
         ))
         if len(hits) >= k:
             break

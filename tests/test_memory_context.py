@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,7 +27,12 @@ from context_manager import ContextPool, repair_tool_sequence
 from server import config as app_config
 from server import memory_context
 from server.context import RequestContext, current_request
-from server.memory_context import TurnMemory, build_block, render_block
+from server.memory_context import (
+    TurnMemory,
+    _node_is_current,
+    build_block,
+    render_block,
+)
 from server.memory_search import EpisodeHit, NodeHit
 from server.memory_store import MemoryStore, close_store
 
@@ -337,6 +345,96 @@ class AgentWiringTest(unittest.TestCase):
                                return_value="") as builder:
             self.messages()
         self.assertEqual(builder.call_args.args[2], "77")
+
+
+class ExternalFactsTest(unittest.TestCase):
+    """Внешние факты: своя квота в блоке и проверка неизменности файла."""
+
+    def web_node(self, node_id: int, host: str = "example.com") -> NodeHit:
+        return NodeHit(
+            id=node_id, kind="fact", name=f"факт {node_id}",
+            text="10000 символов", score=5.0, origin="web",
+            source={"kind": "web", "ref": f"https://{host}/x",
+                    "last_seen": int(time.time()) - 2 * 86400},
+        )
+
+    def file_node(self, node_id: int, path: Path) -> NodeHit:
+        stat = os.stat(path)
+        return NodeHit(
+            id=node_id, kind="rule", name=f"правило {node_id}",
+            text="из файла", score=4.0, origin="tool",
+            source={"kind": "file", "ref": str(path),
+                    "size": stat.st_size, "mtime": int(stat.st_mtime_ns)},
+        )
+
+    def test_external_lines_are_capped(self) -> None:
+        nodes = [self.web_node(i) for i in range(1, 6)]
+        nodes.append(node(99, "личный факт", "оператор любит тишину"))
+        block = render_block(nodes, [], 400)
+        self.assertIn("оператор любит тишину", block)
+        self.assertEqual(block.count("[web "), 3, block)
+        self.assertNotIn("факт 4", block)
+
+    def test_external_line_carries_source_and_age(self) -> None:
+        block = render_block([self.web_node(1)], [], 400)
+        self.assertIn("[web example.com, 2 дн.]", block)
+
+    def test_local_fact_has_no_source_suffix(self) -> None:
+        block = render_block([node()], [], 400)
+        self.assertNotIn("[web ", block)
+        self.assertNotIn("[file ", block)
+
+    def test_unchanged_file_fact_is_shown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "note.md"
+            path.write_text("x", encoding="utf-8")
+            block = render_block([self.file_node(1, path)], [], 400)
+            self.assertIn("[file ", block)
+            self.assertIn("note.md", block)
+
+    def test_changed_file_fact_is_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "note.md"
+            path.write_text("x", encoding="utf-8")
+            hit = self.file_node(1, path)
+            future = int(time.time()) + 60
+            os.utime(path, (future, future))
+            self.assertFalse(_node_is_current(hit))
+            self.assertNotIn("правило 1", render_block([hit], [], 400))
+
+    def test_deleted_file_fact_is_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gone.md"
+            path.write_text("x", encoding="utf-8")
+            hit = self.file_node(1, path)
+            path.unlink()
+            self.assertFalse(_node_is_current(hit))
+
+    def test_build_block_drops_changed_file_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            try:
+                path = Path(tmp) / "note.md"
+                path.write_text("x", encoding="utf-8")
+                stat = os.stat(path)
+                store.upsert_node(
+                    kind="rule", name="правило файла",
+                    name_norm="правило файла",
+                    node_text="правило из файла",
+                    data=json.dumps({
+                        "text": "правило из файла",
+                        "source": {"kind": "file", "ref": str(path),
+                                   "mtime": int(stat.st_mtime_ns)},
+                    }, ensure_ascii=False),
+                    origin="tool",
+                )
+                later = int(time.time()) + 120
+                os.utime(path, (later, later))
+                block = build_block(store, "правило файла")
+                self.assertEqual(block, "")
+            finally:
+                store.close()
+                close_store()
 
 
 if __name__ == "__main__":

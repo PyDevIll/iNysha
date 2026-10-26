@@ -126,6 +126,13 @@ MEMORY_EXTRACT_BATCH = int(os.getenv("MEMORY_EXTRACT_BATCH", "12"))
 # Short replies ("ок", "ага") carry no durable facts and only waste a call.
 MEMORY_EXTRACT_MIN_CHARS = int(os.getenv("MEMORY_EXTRACT_MIN_CHARS", "40"))
 
+# Facts learned from files and pages. A citation must point at something the
+# tools actually returned recently (a URL the model made up is not in `sources`),
+# and external lines get their own quota so they cannot crowd out the operator's
+# own facts in the prompt block.
+MEMORY_SOURCE_WINDOW_DAYS = int(os.getenv("MEMORY_SOURCE_WINDOW_DAYS", "7"))
+MEMORY_BLOCK_EXTERNAL_ITEMS = int(os.getenv("MEMORY_BLOCK_EXTERNAL_ITEMS", "3"))
+
 STATIC_DIR = _env_path("STATIC_DIR", ROOT / "static")
 VOICE_STATIC_DIR = _env_path("VOICE_STATIC_DIR", STATIC_DIR / "voice")
 PROMPTS_DIR = _env_path("PROMPTS_DIR", ROOT / "system_prompts")

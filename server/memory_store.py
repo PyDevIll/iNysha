@@ -27,7 +27,7 @@ from loguru import logger
 from server import config as app_config
 from server.memory_text import lemmatize
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 3000
 
 # ── DDL ────────────────────────────────────────────────────────────────
@@ -206,6 +206,28 @@ def _apply_v2(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE pending_facts ADD COLUMN reviewed_at INTEGER")
 
 
+# v3: what the tools actually returned.  Facts about the outside world are only
+# as good as their source: `memory_remember(source=...)` must point at a row
+# here, which is how an invented URL gets refused.  One small upsert per read.
+_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS sources(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT    NOT NULL CHECK(kind IN ('file','web')),
+    ref        TEXT    NOT NULL,
+    title      TEXT,
+    chat_id    TEXT,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    size       INTEGER,
+    mtime      INTEGER,
+    sha256     TEXT,
+    reads      INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(kind, ref)
+);
+CREATE INDEX IF NOT EXISTS sources_seen ON sources(last_seen);
+"""
+
+
 _TABLES = (
     "episodes",
     "nodes",
@@ -332,6 +354,8 @@ class MemoryStore:
             conn.executescript(_SCHEMA_V1)
         if version < 2:
             _apply_v2(conn)
+        if version < 3:
+            conn.executescript(_SCHEMA_V3)
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -517,6 +541,54 @@ class MemoryStore:
             f"name={row['name']!r} edges_closed={closed.rowcount}"
         )
         return True
+
+    # ── Sources (what the agent really read) ───────────────────────
+    def record_source(
+        self,
+        *,
+        kind: str,
+        ref: str,
+        title: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        size: Optional[int] = None,
+        mtime: Optional[int] = None,
+        sha256: Optional[str] = None,
+    ) -> bool:
+        """Register one successful read; returns ``False`` on a broken DB.
+
+        Best effort like every other memory write: a failure here must never
+        break the turn that produced the tool result.
+        """
+        if kind not in ("file", "web"):
+            logger.warning(f"memory: source kind rejected kind={kind!r}")
+            return False
+        now = now_ts()
+        try:
+            self.connection.execute(
+                "INSERT INTO sources(kind, ref, title, chat_id, first_seen,"
+                " last_seen, size, mtime, sha256, reads)"
+                " VALUES(?,?,?,?,?,?,?,?,?,1)"
+                " ON CONFLICT(kind, ref) DO UPDATE SET"
+                " last_seen=excluded.last_seen,"
+                " title=coalesce(excluded.title, sources.title),"
+                " chat_id=coalesce(excluded.chat_id, sources.chat_id),"
+                " size=coalesce(excluded.size, sources.size),"
+                " mtime=coalesce(excluded.mtime, sources.mtime),"
+                " sha256=coalesce(excluded.sha256, sources.sha256),"
+                " reads=sources.reads+1",
+                (kind, ref, title, chat_id, now, now, size, mtime, sha256),
+            )
+            self.connection.commit()
+        except sqlite3.Error as e:
+            logger.warning(f"memory: source record failed ({kind}): {e}")
+            return False
+        logger.debug(f"memory: source seen kind={kind} ref={ref[:120]}")
+        return True
+
+    def get_source(self, kind: str, ref: str) -> Optional[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM sources WHERE kind=? AND ref=?", (kind, ref)
+        ).fetchone()
 
     # ── Pending candidates ─────────────────────────────────────────
     def list_pending(self, limit: int = 50, status: str = "pending") -> list:

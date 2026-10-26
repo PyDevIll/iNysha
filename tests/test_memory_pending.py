@@ -67,7 +67,7 @@ class MigrationTest(unittest.TestCase):
         self.make_v1_database()
         store = MemoryStore(self.db_path)
         try:
-            self.assertEqual(store.schema_version, 2)
+            self.assertEqual(store.schema_version, ms.SCHEMA_VERSION)
             cols = self.columns(store)
             self.assertIn("node_id", cols)
             self.assertIn("reviewed_at", cols)
@@ -82,7 +82,7 @@ class MigrationTest(unittest.TestCase):
         MemoryStore(self.db_path).close()
         again = MemoryStore(self.db_path)
         try:
-            self.assertEqual(again.schema_version, 2)
+            self.assertEqual(again.schema_version, ms.SCHEMA_VERSION)
             self.assertIn("node_id", self.columns(again))
         finally:
             again.close()
@@ -90,8 +90,24 @@ class MigrationTest(unittest.TestCase):
     def test_fresh_database_has_review_columns(self) -> None:
         store = MemoryStore(self.db_path)
         try:
-            self.assertEqual(store.schema_version, 2)
+            self.assertEqual(store.schema_version, ms.SCHEMA_VERSION)
             self.assertIn("reviewed_at", self.columns(store))
+        finally:
+            store.close()
+
+    def test_v1_file_also_gets_the_sources_table(self) -> None:
+        """v3 идёт следом за v2: старый файл получает и разбор, и источники."""
+        self.make_v1_database()
+        store = MemoryStore(self.db_path)
+        try:
+            self.assertEqual(store.schema_version, ms.SCHEMA_VERSION)
+            tables = {
+                str(row["name"])
+                for row in store.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertIn("sources", tables)
         finally:
             store.close()
 
