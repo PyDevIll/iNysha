@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from server import config as app_config
-from server.memory_episodes import EpisodeLog
+from server.memory_episodes import EpisodeLog, strip_meta
 from server.memory_text import preview
 
 import tiktoken
@@ -513,6 +513,7 @@ class ContextPool:
         self._save_counter: int = 0
         self.overflow: bool = False
         self.base_prompt_tokens: int = 0   # static system+base prompt cost (set by Agent)
+        self.memory_block_tokens: int = 0  # per-turn memory block (dynamic, not cached)
         self._compression_task: Optional[asyncio.Task] = None
 
         # Caches
@@ -611,6 +612,7 @@ class ContextPool:
         number the overflow / compression decision must use.
         """
         total = self.base_prompt_tokens
+        total += self.memory_block_tokens
         total += _token_count(self._persistent.as_context_string())
         for d in self._compressed_dicts:
             total += self._compressed_dict_tokens(d)
@@ -696,6 +698,7 @@ class ContextPool:
         self,
         system_message: dict,
         base_messages: Optional[list[dict]] = None,
+        memory_block: str = "",
     ) -> list[dict]:
         """Build the single, canonical OpenAI-format message list for the LLM.
 
@@ -703,6 +706,12 @@ class ContextPool:
         is intentionally cache-friendly:
 
           system → base prompts → persistent → compressed → masked → sliding
+
+        ``memory_block`` (the per-turn memory selection) is inserted **before
+        the first message of the current turn**, i.e. in the tail, never in the
+        prefix and never inside an ``assistant.tool_calls`` → ``tool`` group.
+        Its cost is tracked separately from the static prompts so overflow
+        accounting sees it without poisoning the prefix-cache baseline.
 
         Keeping this inside ``ContextPool`` means callers no longer have to
         reach into ``_persistent`` / ``_compressed_dicts`` / ``_all_entries``
@@ -739,7 +748,46 @@ class ContextPool:
         for entry in sliding_entries:
             messages.append(self._entry_to_openai_dict(entry))
 
+        self.memory_block_tokens = 0
+        if memory_block:
+            index = self._memory_insert_index(messages)
+            if index is not None:
+                messages.insert(index, {
+                    "role": "user",
+                    "name": "MEMORY",
+                    "content": memory_block,
+                })
+                self.memory_block_tokens = _token_count(memory_block)
+
         return messages
+
+    @staticmethod
+    def _memory_insert_index(messages: list[dict]) -> Optional[int]:
+        """Index of the first message of the current turn, or ``None``.
+
+        The last ``user`` message is the one this turn started with; the
+        profile block (``name=MASTERMIND``) is skipped so an empty turn cannot
+        turn the persistent profile into the insertion anchor.
+        """
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.get("role") != "user":
+                continue
+            if message.get("name") == "MASTERMIND":
+                return None
+            return index
+        return None
+
+    def last_user_text(self) -> str:
+        """Utterance that started the current turn, without transport markers."""
+        for entry in reversed(self._all_entries):
+            if entry.role != "user":
+                continue
+            text = strip_meta(entry.content or "")
+            if not text or text.startswith("[Tool result"):
+                continue
+            return text[:1000]
+        return ""
 
     def build_context(self, system_prompt: str = "") -> tuple[str, TokenBudget]:
         """Diagnostic text rendering of the canonical message list.

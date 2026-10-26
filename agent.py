@@ -13,7 +13,10 @@ from loguru import logger
 
 from context_manager import ContextPool, count_tokens, repair_tool_sequence
 from server import config as app_config
-from server.context import is_voice_context
+from server import memory_context
+from server.context import get_request_context, is_voice_context
+from server.memory_context import TurnMemory
+from server.memory_store import get_store
 from tool_registry import get_registry
 
 LLM_MAX_OUTPUT_TOKENS = app_config.LLM_MAX_OUTPUT_TOKENS
@@ -149,6 +152,7 @@ class Agent:
         self._use_tools = use_tools
         self._save_history = save_history
         self._helper_agent: Optional[Agent] = None
+        self._turn_memory = TurnMemory()
         self.messages = ContextPool()
         self.messages.set_base_prompt_tokens(self._static_prompt_tokens())
 
@@ -273,12 +277,31 @@ class Agent:
         DeepSeek cache-optimized:
 
           system → base prompts → persistent → compressed → masked → sliding
+
+        The per-turn memory block is retrieved here (not inside the pool) and
+        memoised for the whole turn: ``llm_request`` runs up to 15 times per
+        turn, and a block that changed between iterations would invalidate the
+        cache every time.
         """
         self.messages.log_state("STATE AT build_messages_for_llm")
+
+        memory_block = ""
+        if memory_context.enabled():
+            query = self.messages.last_user_text()
+            if query:
+                chat_id = get_request_context().chat_id if get_request_context() else None
+                memory_block = self._turn_memory.get(
+                    query,
+                    chat_id,
+                    lambda: memory_context.build_block(
+                        get_store(), query, chat_id
+                    ),
+                )
 
         messages = self.messages.build_llm_messages(
             self._system_prompt,
             construct_history(self._base_prompts),
+            memory_block=memory_block,
         )
 
         # ---- NORMALISE: guarantee a valid tool-call / tool-result pairing ----
@@ -367,6 +390,9 @@ class Agent:
         # A background compression rewrites _all_entries. Wait for it before
         # appending anything, otherwise a new turn interleaves with the trim.
         await self.messages.await_compression()
+        # New input → new memory selection; the previous turn's block must not
+        # be reused.
+        self._turn_memory.reset()
 
         # Add user message to context
         if initial_user_request:

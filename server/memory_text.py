@@ -43,6 +43,16 @@ def has_morphology() -> bool:
     return _get_morph() is not None
 
 
+def warmup() -> bool:
+    """Load morphology before the first turn.
+
+    Importing pymorphy3 dictionaries takes ~100 ms, which is invisible at boot
+    and very visible on the first voice turn. ``runtime.startup`` calls this
+    when the memory backend is enabled; the call is idempotent.
+    """
+    return has_morphology()
+
+
 def _get_morph():
     """Lazily build the shared MorphAnalyzer (thread-safe, created once)."""
     global _morph, _morph_attempted

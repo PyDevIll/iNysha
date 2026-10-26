@@ -183,6 +183,11 @@ class Runtime:
         configure_logging()
         logger.info(f"{config.INSTANCE_NAME} cloud starting...")
 
+        # pymorphy3 dictionaries load lazily (~100 ms). Paying that on the
+        # first turn is invisible at boot and very visible in a voice turn.
+        if memory_context.enabled():
+            memory_context.warmup()
+
         # get_registry() auto-registers builtins exactly once.  Do not call
         # builtin_tools.register_all() again here (it would duplicate logs and
         # work); only install the client tool layer on top.
