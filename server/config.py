@@ -100,6 +100,11 @@ MEMORY_DB_PATH = _env_path("MEMORY_DB_PATH", DATA_DIR / "memory.db")
 MEMORY_BLOCK_TOKENS = int(os.getenv("MEMORY_BLOCK_TOKENS", "400"))
 MEMORY_BLOCK_MAX_ITEMS = int(os.getenv("MEMORY_BLOCK_MAX_ITEMS", "8"))
 MEMORY_ITEM_TOKENS = int(os.getenv("MEMORY_ITEM_TOKENS", "60"))
+# The profile block (persistent_memory.json) is always in the prompt, so it has
+# its own budget: everything above it is trimmed with an explicit marker.
+# After the split into data/lessons.md, data/ideas.md, data/lore_*.md and
+# data/servers.md the profile renders at ~560 tokens; 700 leaves headroom.
+MEMORY_PROFILE_TOKENS = int(os.getenv("MEMORY_PROFILE_TOKENS", "700"))
 # Memory has its own log sink: retrieval debugging needs DEBUG, while the main
 # agent.log is dominated by transport and turn noise. Both sinks get the lines.
 MEMORY_LOG_FILE = _env_path("MEMORY_LOG_FILE", DATA_DIR / "memory.log")

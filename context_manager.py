@@ -327,6 +327,127 @@ class ObservationMasker:
         return masked_entry
 
 
+# ── Persistent profile rendering ───────────────────────────────────────
+# The profile block is in every prompt, so it is rendered compactly: no
+# Python repr (that is where "- **facts**: {'operator_andrey': ...}" came
+# from — 10.5 KB / 4.4 k tokens on every turn), one line per leaf, hard
+# budget in tokens.  Stable key order keeps the prefix cache valid.
+PERSISTENT_VALUE_CHARS = 300       # cap for one scalar value
+PERSISTENT_MAX_DEPTH = 2           # deeper structures are inlined
+PERSISTENT_MAX_TOKENS = int(getattr(app_config, "MEMORY_PROFILE_TOKENS", 700))
+
+
+def _scalar(value) -> str:
+    """One-line rendering of a leaf value, capped and without repr noise."""
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    text = " ".join(str(value).split())
+    if len(text) > PERSISTENT_VALUE_CHARS:
+        return f"{text[:PERSISTENT_VALUE_CHARS]}…(+{len(text) - PERSISTENT_VALUE_CHARS} симв.)"
+    return text
+
+
+def _inline(value) -> str:
+    """Flatten a nested container into ``k: v; k: v`` — no indentation growth."""
+    if isinstance(value, dict):
+        parts = [
+            f"{k}: {_inline(v)}"
+            for k, v in value.items()
+            if v not in ("", None)
+        ]
+        return "; ".join(parts)
+    if isinstance(value, (list, tuple)):
+        return "; ".join(_inline(item) for item in value)
+    return _scalar(value)
+
+
+def render_persistent(
+    data: dict,
+    max_tokens: int = PERSISTENT_MAX_TOKENS,
+) -> str:
+    """Render the persistent profile as compact Markdown within a token budget.
+
+    Deterministic for a given ``data``: the key order of the JSON file is the
+    output order, so an unchanged profile produces a byte-identical block and
+    the provider's prefix cache keeps hitting.  When the budget is exceeded the
+    tail is dropped with a visible marker instead of silently overflowing the
+    context.
+    """
+    if not data:
+        return ""
+
+    # One block per top-level key: a block is kept or dropped whole, so the
+    # prompt never ends with a header whose children were cut off.
+    blocks: list[tuple[str, list[str]]] = []
+    for key, value in data.items():
+        block = [f"- **{key}**"]
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, (dict, list, tuple)):
+                    block.append(f"  - {sub_key}: {_inline(sub_value)}")
+                else:
+                    block.append(f"  - {sub_key}: {_scalar(sub_value)}")
+            if len(block) == 1:  # пустой словарь не оставляет висячий заголовок
+                block = [f"- **{key}**: —"]
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                block.append(f"  - {_inline(item)}")
+            if len(block) == 1:
+                block = [f"- **{key}**: —"]
+        else:
+            block = [f"- **{key}**: {_scalar(value)}"]
+        blocks.append((key, block))
+
+    def cost_of(block: list[str]) -> int:
+        return sum(_token_count(line) + 1 for line in block)
+
+    kept: list[tuple[str, list[str]]] = []
+    dropped: list[str] = []
+    used = _token_count("## Persistent Memory") + 1
+    for key, block in blocks:
+        cost = cost_of(block)
+        if used + cost > max_tokens:
+            dropped.append(key)
+            continue
+        kept.append((key, block))
+        used += cost
+
+    if dropped:
+        # The marker is part of the budget too: drop trailing blocks until both
+        # fit, so the block never exceeds its own cap by "just a note".
+        while kept:
+            marker_cost = _token_count(_trim_marker(len(dropped))) + 1
+            if used + marker_cost <= max_tokens:
+                break
+            key, block = kept.pop()
+            used -= cost_of(block)
+            dropped.insert(0, key)
+        marker = _trim_marker(len(dropped))
+        logger.debug(
+            f"Persistent profile trimmed: dropped={dropped} "
+            f"(budget={max_tokens}, used={used + _token_count(marker) + 1})"
+        )
+    else:
+        marker = ""
+
+    lines = ["## Persistent Memory"]
+    for _key, block in kept:
+        lines.extend(block)
+    if marker:
+        lines.append(marker)
+    return "\n".join(lines) + "\n"
+
+
+def _trim_marker(dropped_blocks: int) -> str:
+    """Short, token-cheap notice; which blocks went is in the DEBUG log."""
+    return (
+        f"- …обрезано {dropped_blocks} блок(ов) профиля — "
+        f"{PERSISTENT_FILE} (fs_read)"
+    )
+
+
 # ── Persistent Store ───────────────────────────────────────────────────
 class PersistentStore:
     """Key facts surviving across sessions (user identity, critical knowledge)."""
@@ -360,12 +481,7 @@ class PersistentStore:
         return self._data.get(key, default)
 
     def as_context_string(self) -> str:
-        if not self._data:
-            return ""
-        lines = ["## Persistent Memory"]
-        for k, v in self._data.items():
-            lines.append(f"- **{k}**: {v}")
-        return "\n".join(lines) + "\n"
+        return render_persistent(self._data)
 
 
 # ── ContextPool v3 ─────────────────────────────────────────────────────
