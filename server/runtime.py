@@ -36,6 +36,16 @@ def configure_logging() -> None:
         level="DEBUG",
         enqueue=True,
     )
+    # Память отлаживают отдельно от остального шума: у неё свой файл, чтобы
+    # retrieval можно было читать с DEBUG, не раздувая agent.log.
+    logger.add(
+        config.MEMORY_LOG_FILE,
+        rotation="1 MB",
+        retention="7 days",
+        level=config.MEMORY_LOG_LEVEL,
+        enqueue=True,
+        filter=lambda record: str(record["name"]).startswith("server.memory"),
+    )
 
 
 async def scheduler_loop(rt: "Runtime", tick: float = 15.0) -> None:

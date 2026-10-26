@@ -26,6 +26,54 @@ MAX_API_URL = "https://platform-api2.max.ru"
 RETRY_INTERVAL = 5  # seconds
 LONG_POLL_TIMEOUT = 30  # seconds
 
+# Bodies carry private message text and (for uploads) signed tokens, so the
+# DEBUG line only previews them; the full value is one TRACE level deeper.
+_LOG_PREVIEW_CHARS = 200
+
+
+def _brief(value: Any, limit: int = _LOG_PREVIEW_CHARS) -> str:
+    """Short, secret-safe rendering of a request/response field for a log."""
+    text = value if isinstance(value, str) else repr(value)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…({len(text)} chars)"
+
+
+def _mask_secret(token: Any) -> str:
+    """Never log an upload token itself — only its length."""
+    return f"<set len={len(str(token or ''))}>"
+
+
+_SECRET_KEYS = frozenset(
+    {"token", "access_token", "auth_token", "refresh_token", "secret",
+     "password", "api_key", "bot_token"}
+)
+
+
+def _redact(value: Any, depth: int = 0) -> Any:
+    """Recursively hide credential fields inside a request/response payload.
+
+    Upload tokens travel inside ``attachments[].payload.token``, so previewing
+    a body is not enough — the field itself must go before the text is cut.
+    """
+    if depth > 6:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: (
+                _mask_secret(val)
+                if str(key).lower() in _SECRET_KEYS
+                else _redact(val, depth + 1)
+            )
+            for key, val in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact(item, depth + 1) for item in value]
+    return value
+
+
+
 
 def sent_message(response: Dict[str, Any]) -> Dict[str, Any]:
     """Extract ``message`` from a ``POST /messages`` response, or ``{}``."""
@@ -343,7 +391,13 @@ class MAXBotApi:
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         client = await self._get_client()
-        logger.debug(f"[_request] {method} {path} query={query} body={body}")
+        logger.debug(
+            f"[_request] {method} {path} query={_brief(_redact(query))} "
+            f"body={_brief(_redact(body))}"
+        )
+        logger.trace(
+            f"[_request] full query={_redact(query)} body={_redact(body)}"
+        )
         try:
             response = await client.request(
                 method=method,
@@ -351,7 +405,11 @@ class MAXBotApi:
                 params=query,
                 json=body,
             )
-            logger.debug(f"[_request] response status={response.status_code} body={response.text[:500]}")
+            logger.debug(
+                f"[_request] response status={response.status_code} "
+                f"body={_brief(response.text, 300)}"
+            )
+            logger.trace(f"[_request] full response={response.text}")
             response.raise_for_status()
             return response.json()
         except httpx.TimeoutException:
@@ -398,14 +456,18 @@ class MAXBotApi:
         body = {"text": text}
         if extra:
             body.update(extra)
-        logger.debug(f"[send_message_to_chat] chat_id={chat_id} text='{text}' extra={extra} final_body={body}")
+        logger.debug(
+            f"[send_message_to_chat] chat_id={chat_id} text={_brief(text, 120)!r} "
+            f"extra={_brief(_redact(extra))} body={_brief(_redact(body))}"
+        )
+        logger.trace(f"[send_message_to_chat] full body={_redact(body)}")
         result = await self._request(
             "POST",
             "/messages",
             query={"chat_id": chat_id},
             body=body,
         )
-        logger.debug(f"[send_message_to_chat] result={result}")
+        logger.debug(f"[send_message_to_chat] result={_brief(result)}")
         return result
 
     async def send_message_to_user(self, user_id: int, text: str, extra: Optional[Dict] = None) -> Dict:
@@ -699,12 +761,14 @@ class MAXBot:
 
         # Upload file first
         upload_result = await self._api.upload_file(str(path), "file")
-        logger.debug(f"[send_document] upload_result={upload_result}")
+        logger.debug(
+            f"[send_document] upload_result={_brief(_redact(upload_result))}"
+        )
         if not upload_result.get("ok"):
             return {"ok": False, "error": upload_result.get("error", "Upload failed")}
 
         token = upload_result.get("result", {}).get("token")
-        logger.debug(f"[send_document] token='{token}'")
+        logger.debug(f"[send_document] token={_mask_secret(token)}")
         if not token:
             return {"ok": False, "error": "No token from upload"}
 
@@ -717,9 +781,12 @@ class MAXBot:
         if caption:
             extra["text"] = caption
 
-        logger.debug(f"[send_document] chat_id={chat_id} caption={caption!r} text_param={text_param!r} extra={extra}")
+        logger.debug(
+            f"[send_document] chat_id={chat_id} caption={_brief(caption, 80)!r} "
+            f"text_param={_brief(text_param, 80)!r} extra={_brief(extra)}"
+        )
         result = await self._api.send_message_to_chat(chat_id, text_param, extra)
-        logger.debug(f"[send_document] send_message_to_chat result={result}")
+        logger.debug(f"[send_document] send_message_to_chat result={_brief(result)}")
         message = sent_message(result)
         if message:
             return {"ok": True, "result": message}
@@ -737,12 +804,14 @@ class MAXBot:
 
         # Upload audio
         upload_result = await self._api.upload_file(str(path), "audio")
-        logger.debug(f"[send_voice] upload_result={upload_result}")
+        logger.debug(
+            f"[send_voice] upload_result={_brief(_redact(upload_result))}"
+        )
         if not upload_result.get("ok"):
             return {"ok": False, "error": upload_result.get("error", "Upload failed")}
 
         token = upload_result.get("result", {}).get("token")
-        logger.debug(f"[send_voice] token='{token}'")
+        logger.debug(f"[send_voice] token={_mask_secret(token)}")
         if not token:
             return {"ok": False, "error": "No token from upload"}
 
@@ -757,9 +826,12 @@ class MAXBot:
         await asyncio.sleep(2)
 
         text_param = caption or "voice"
-        logger.debug(f"[send_voice] chat_id={chat_id} caption={caption!r} text_param={text_param!r} extra={extra}")
+        logger.debug(
+            f"[send_voice] chat_id={chat_id} caption={_brief(caption, 80)!r} "
+            f"text_param={_brief(text_param, 80)!r} extra={_brief(extra)}"
+        )
         result = await self._api.send_message_to_chat(chat_id, text_param, extra)
-        logger.debug(f"[send_voice] send_message_to_chat result={result}")
+        logger.debug(f"[send_voice] send_message_to_chat result={_brief(result)}")
         message = sent_message(result)
         if message:
             return {"ok": True, "result": message}

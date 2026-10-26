@@ -18,6 +18,8 @@ import re
 import threading
 from functools import lru_cache
 
+from loguru import logger
+
 # Letters of the Russian alphabet plus ASCII; everything else is a separator.
 _WORD_RE = re.compile(r"[0-9a-zа-яё]+")
 _EDGE_PUNCT_RE = re.compile(r"^[^\w]+|[^\w]+$", re.UNICODE)
@@ -53,8 +55,15 @@ def _get_morph():
                 import pymorphy3
 
                 _morph = pymorphy3.MorphAnalyzer()
-            except Exception:  # pragma: no cover - depends on install
+                logger.debug("memory: morphology ready (pymorphy3)")
+            except Exception as e:  # pragma: no cover - depends on install
                 _morph = None
+                # Silent degradation would hide exactly the bug FTS is meant to
+                # avoid (word forms never matching), so say it once, loudly.
+                logger.warning(
+                    f"memory: pymorphy3 unavailable ({e}) — full-text search "
+                    f"falls back to exact word forms"
+                )
     return _morph
 
 
@@ -138,4 +147,19 @@ def fts_query(text: str, prefix_len: int | None = None) -> str:
             parts.append(f'"{token[:prefix_len]}"*')
         else:
             parts.append(f'"{token}"')
-    return " OR ".join(parts)
+    query = " OR ".join(parts)
+    logger.trace(f"memory: fts_query tokens={len(unique)} prefix={prefix_len}")
+    return query
+
+
+def preview(text: str | None, limit: int = 60) -> str:
+    """Shorten a value for a log line — facts are private and can be long.
+
+    Logs carry ids, kinds and counts; the text itself is only previewed.
+    """
+    if text is None:
+        return ""
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    return f"{flat[:limit]}…({len(flat)} chars)"

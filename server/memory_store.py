@@ -236,12 +236,13 @@ class MemoryStore:
 
     def _open(self) -> sqlite3.Connection:
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        existed = self._path.exists()
         conn = sqlite3.connect(str(self._path), timeout=BUSY_TIMEOUT_MS / 1000)
         # data/ holds real conversation history; the DB must not be world-readable.
         try:
             self._path.chmod(0o600)
-        except OSError:  # pragma: no cover - exotic filesystems
-            pass
+        except OSError as e:  # pragma: no cover - exotic filesystems
+            logger.debug(f"memory: chmod 0600 failed for {self._path}: {e}")
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         # WAL keeps a crash from truncating the file; synchronous=NORMAL is the
@@ -251,7 +252,10 @@ class MemoryStore:
         # Off by default in SQLite; the edges table relies on real FKs.
         conn.execute("PRAGMA foreign_keys=ON")
         self._migrate(conn)
-        logger.info(f"Memory store ready: {self._path} (schema v{SCHEMA_VERSION})")
+        logger.info(
+            f"memory: store ready path={self._path} schema=v{SCHEMA_VERSION} "
+            f"new_file={not existed}"
+        )
         return conn
 
     def close(self) -> None:
@@ -259,10 +263,11 @@ class MemoryStore:
             if self._conn is not None:
                 try:
                     self._conn.execute("PRAGMA optimize")
-                except Exception:  # pragma: no cover - best effort
-                    pass
+                except Exception as e:  # pragma: no cover - best effort
+                    logger.debug(f"memory: PRAGMA optimize failed: {e}")
                 self._conn.close()
                 self._conn = None
+                logger.debug(f"memory: store closed path={self._path}")
 
     def __enter__(self) -> "MemoryStore":
         self.connection  # noqa: B018 - force open/migrate
@@ -275,6 +280,10 @@ class MemoryStore:
     def _migrate(self, conn: sqlite3.Connection) -> None:
         version = self._read_version(conn)
         if version > SCHEMA_VERSION:
+            logger.error(
+                f"memory: refusing to open {self._path}: database schema "
+                f"v{version} > code v{SCHEMA_VERSION}"
+            )
             raise RuntimeError(
                 f"memory.db schema v{version} is newer than this code "
                 f"(v{SCHEMA_VERSION}); upgrade the checkout instead of "
@@ -282,9 +291,11 @@ class MemoryStore:
             )
         if version == SCHEMA_VERSION:
             self._schema_version = version
+            logger.debug(f"memory: schema already v{version}, no migration")
             return
         # v0 -> v1: create everything.  Later versions append their own step
         # here and bump SCHEMA_VERSION; never edit a shipped block in place.
+        logger.info(f"memory: migrating schema v{version} -> v{SCHEMA_VERSION}")
         conn.executescript(_SCHEMA_V1)
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
@@ -298,6 +309,10 @@ class MemoryStore:
         )
         conn.commit()
         self._schema_version = SCHEMA_VERSION
+        logger.info(
+            f"memory: schema v{SCHEMA_VERSION} applied "
+            f"(tables={len(_TABLES)}, fts=nodes_fts,episodes_fts)"
+        )
 
     @staticmethod
     def _read_version(conn: sqlite3.Connection) -> int:
@@ -333,7 +348,15 @@ class MemoryStore:
 
     def integrity_ok(self) -> bool:
         row = self.connection.execute("PRAGMA integrity_check").fetchone()
-        return bool(row) and row[0] == "ok"
+        ok = bool(row) and row[0] == "ok"
+        if not ok:
+            logger.error(
+                f"memory: integrity_check failed on {self._path}: "
+                f"{row[0] if row else 'no result'}"
+            )
+        else:
+            logger.debug(f"memory: integrity_check ok ({self._path})")
+        return ok
 
 
 # ── Process-wide singleton ─────────────────────────────────────────────

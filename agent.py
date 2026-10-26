@@ -319,7 +319,10 @@ class Agent:
         voice_mode = self._is_voice_turn()
         tools = registry.get_openai_tools(voice_mode=voice_mode) if self._use_tools else []
         if tools:
-            logger.debug(f"llm_request: passing {len(tools)} tools to API: {[t['function']['name'] for t in tools]}")
+            logger.debug(f"llm_request: passing {len(tools)} tools")
+            logger.trace(
+                f"llm_request: tools={[t['function']['name'] for t in tools]}"
+            )
 
         try:
             response = await self._client.chat.completions.create(
@@ -393,7 +396,7 @@ class Agent:
                 response = await self.llm_request(enable_reasoning)
             except Exception as e:
                 logger.exception(f"LLM request failed at iteration {iteration}")
-                self.messages.log_state("FAILED LLM REQUEST")
+                self.messages.log_state("FAILED LLM REQUEST", detailed=True)
                 import json
                 with open("failed_context.json", "w", encoding='utf-8') as f:
                     json.dump([self.messages._entry_to_dict(e) for e in self.messages._all_entries], f, indent=2,
@@ -409,8 +412,10 @@ class Agent:
                 await reasoning_callback(reasoning)
 
             has_tool_calls = bool(message.get("tool_calls"))
-            logger.debug(f"run: has_tool_calls={has_tool_calls}, message keys={list(message.keys())}")
-            logger.debug("run: about to call append_assistant_message")
+            logger.trace(
+                f"run: has_tool_calls={has_tool_calls}, "
+                f"message keys={list(message.keys())}"
+            )
             self.messages.append_assistant_message(message, self._save_history, has_tool_calls)
 
             if has_tool_calls:

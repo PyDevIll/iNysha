@@ -22,6 +22,7 @@ import asyncio
 import json
 import re
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from server import config as app_config
+from server.memory_text import preview
 
 import tiktoken
 from loguru import logger
@@ -188,13 +190,12 @@ def repair_tool_sequence(messages: list[dict]) -> list[dict]:
     """
     repaired: list[dict] = []
     pending: dict[str, str] = {}      # tool_call_id -> function name
+    synthesised: list[tuple[str, str]] = []   # (call_id, name)
+    orphaned: list[tuple[str, str]] = []
 
     def flush_pending() -> None:
         for call_id, name in pending.items():
-            logger.warning(
-                f"repair_tool_sequence: synthesising interrupted result for "
-                f"{name or 'unknown'} ({call_id})"
-            )
+            synthesised.append((call_id, name or "unknown"))
             repaired.append({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -212,10 +213,7 @@ def repair_tool_sequence(messages: list[dict]) -> list[dict]:
                 del pending[call_id]
                 repaired.append(msg)
             else:
-                logger.warning(
-                    f"repair_tool_sequence: orphaned tool result "
-                    f"({msg.get('name') or 'unknown'}, {call_id}) → user message"
-                )
+                orphaned.append((call_id or "", msg.get("name") or "unknown"))
                 repaired.append({
                     "role": "user",
                     "content": (
@@ -241,7 +239,57 @@ def repair_tool_sequence(messages: list[dict]) -> list[dict]:
                     pending[call_id] = function.get("name", "")
 
     flush_pending()
+    _report_repairs(synthesised, orphaned)
     return repaired
+
+
+# Master-log keeps the damage (a crash or a cut group), so every request
+# repairs the same ids again. Reporting each repair every time turned a single
+# broken tool call into 66 warnings per 400 KB of log — noise that hides real
+# ones. Remember what was already reported for the lifetime of the process.
+_REPAIR_REPORTED: "OrderedDict[str, None]" = OrderedDict()
+_REPAIR_REPORTED_MAX = 256
+
+
+def _note_repair(kind: str, name: str, call_id: str) -> bool:
+    """Record one repaired item; True if it has not been reported yet."""
+    key = f"{kind}:{call_id or name}"
+    if key in _REPAIR_REPORTED:
+        return False
+    _REPAIR_REPORTED[key] = None
+    while len(_REPAIR_REPORTED) > _REPAIR_REPORTED_MAX:
+        _REPAIR_REPORTED.popitem(last=False)
+    return True
+
+
+def _report_repairs(
+    synthesised: list[tuple[str, str]],
+    orphaned: list[tuple[str, str]],
+) -> None:
+    """One line per repair pass, without repeating already-known damage."""
+    fresh_syn = [n for cid, n in synthesised if _note_repair("syn", n, cid)]
+    fresh_orph = [n for cid, n in orphaned if _note_repair("orph", n, cid)]
+
+    def names(items: list[str]) -> str:
+        shown = ", ".join(sorted(set(items))[:3])
+        rest = len(set(items)) - 3
+        return shown + (f" +{rest}" if rest > 0 else "")
+
+    if not fresh_syn and not fresh_orph:
+        logger.debug(
+            f"repair_tool_sequence: {len(synthesised)} synthesised, "
+            f"{len(orphaned)} orphaned — all reported earlier, restorable "
+            f"log damage from a previous crash"
+        )
+        return
+    parts = []
+    if fresh_syn:
+        parts.append(f"synthesised={len(fresh_syn)} ({names(fresh_syn)})")
+    if fresh_orph:
+        parts.append(f"orphaned={len(fresh_orph)} ({names(fresh_orph)})")
+    repeated = (len(synthesised) - len(fresh_syn)) + (len(orphaned) - len(fresh_orph))
+    suffix = f"; {repeated} repeated" if repeated else ""
+    logger.warning(f"repair_tool_sequence: {' '.join(parts)}{suffix}")
 
 
 # ── Observation Masker ─────────────────────────────────────────────────
@@ -603,7 +651,7 @@ class ContextPool:
         still needs at least two entries beyond the sliding window to summarize.
         """
         async with self._compress_lock:
-            self.log_state("BEFORE compression")
+            self.log_state("BEFORE compression", detailed=True)
 
             assembled = self.get_assembled_tokens()
             overflow_ratio = assembled / self.max_tokens if self.max_tokens > 0 else 0
@@ -717,7 +765,7 @@ class ContextPool:
                 logger.info(f"Compressed dicts count {len(self._compressed_dicts)} exceeds threshold, merging...")
                 await self.compress_compressed(helper_agent)
 
-            self.log_state("AFTER compression")
+            self.log_state("AFTER compression", detailed=True)
             return compressed_text
 
     async def compress_compressed(self, helper_agent) -> Optional[str]:
@@ -1198,24 +1246,35 @@ class ContextPool:
             self._token_counts[eid] = _token_count(text)
         return self._token_counts[eid]
 
-    def log_state(self, tag: str = "") -> None:
-        logger.info(f"=== Context state {tag} ===")
-        logger.info(f"  Total entries: {len(self._all_entries)}")
-        logger.info(f"  Sliding window (>= {self.window_size}, step {self.mask_batch_size}): "
-                    f"{len(self.sliding_window)} entries | boundary={self._split}")
+    def log_state(self, tag: str = "", detailed: bool = False) -> None:
+        """Emit the memory-layer state for this turn.
+
+        One DEBUG line is enough to reconstruct a turn; the old 13-line dump
+        was ~30% of agent.log (85 calls → 1105 lines). The details stay
+        available at TRACE, and ``detailed=True`` promotes them to INFO for
+        the rare paths where they matter (failed request, compression).
+        """
+        sliding = len(self.sliding_window)
+        logger.debug(
+            f"ctx[{tag}]: entries={len(self._all_entries)} boundary={self._split} "
+            f"sliding={sliding} masked={len(self._all_entries) - sliding} "
+            f"compressed={len(self._compressed_dicts)} "
+            f"persistent={len(self._persistent.facts)} "
+            f"master_tok={self.get_context_length()} "
+            f"assembled={self.get_assembled_tokens()}/base={self.base_prompt_tokens} "
+            f"overflow={self.overflow}"
+        )
+        # TRACE keeps the old 13-line dump available without raising DEBUG volume.
+        log = logger.info if detailed else logger.trace
         if self.sliding_window:
             first = self.sliding_window[0]
             last = self.sliding_window[-1]
-            first_preview = (first.content[:50] if first.content else "[No content]")
-            last_preview = (last.content[:50] if last.content else "[No content]")
-            logger.info(f"    first: {first.role} '{first_preview}'")
-            logger.info(f"    last:  {last.role} '{last_preview}'")
-        logger.info(f"  Compressed entries (dicts): {len(self._compressed_dicts)}")
-        total_comp_tokens = sum(self._compressed_dict_tokens(d) for d in self._compressed_dicts)
-        logger.info(f"    tokens: ~{total_comp_tokens} (incl. raw_text fallback)")
-        logger.info(f"  Masked entries (old): {len(self.masked_entries)}")
-        logger.info(f"  Persistent facts: {len(self._persistent.facts)}")
-        logger.info(f"  Master-log tokens: {self.get_context_length()}")
-        logger.info(f"  Assembled tokens: {self.get_assembled_tokens()} (base={self.base_prompt_tokens})")
-        logger.info(f"  Overflow flag: {self.overflow}")
-        logger.info("=====================================")
+            log(
+                f"ctx[{tag}]: first={first.role} "
+                f"{preview(first.content, 50)!r} | last={last.role} "
+                f"{preview(last.content, 50)!r}"
+            )
+        log(
+            f"ctx[{tag}]: window>={self.window_size} step={self.mask_batch_size} "
+            f"compressed_tok={sum(self._compressed_dict_tokens(d) for d in self._compressed_dicts)}"
+        )

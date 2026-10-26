@@ -606,10 +606,10 @@ class VoiceSession:
             pieces_seen = 0
 
             def on_tts_status(info: dict[str, Any]) -> None:
-                """Log each ready Google TTS piece."""
+                """Log each ready Google TTS piece (per-chunk detail → DEBUG)."""
                 nonlocal pieces_seen
                 pieces_seen = int(info["total"])
-                logger.info(
+                logger.debug(
                     f"voice {self.session_id}: google TTS piece "
                     f"{info['index'] + 1}/{info['total']} "
                     f"({len(info['text'])} chars, mp3={info['mp3_bytes']}B, "

@@ -100,6 +100,10 @@ MEMORY_DB_PATH = _env_path("MEMORY_DB_PATH", DATA_DIR / "memory.db")
 MEMORY_BLOCK_TOKENS = int(os.getenv("MEMORY_BLOCK_TOKENS", "400"))
 MEMORY_BLOCK_MAX_ITEMS = int(os.getenv("MEMORY_BLOCK_MAX_ITEMS", "8"))
 MEMORY_ITEM_TOKENS = int(os.getenv("MEMORY_ITEM_TOKENS", "60"))
+# Memory has its own log sink: retrieval debugging needs DEBUG, while the main
+# agent.log is dominated by transport and turn noise. Both sinks get the lines.
+MEMORY_LOG_FILE = _env_path("MEMORY_LOG_FILE", DATA_DIR / "memory.log")
+MEMORY_LOG_LEVEL = _env_str("MEMORY_LOG_LEVEL", "DEBUG")
 
 STATIC_DIR = _env_path("STATIC_DIR", ROOT / "static")
 VOICE_STATIC_DIR = _env_path("VOICE_STATIC_DIR", STATIC_DIR / "voice")
@@ -239,5 +243,6 @@ def ensure_dirs() -> None:
         SCHEDULER_TASKS_FILE.parent,
         MAX_MARKER_FILE.parent,
         MEMORY_DB_PATH.parent,
+        MEMORY_LOG_FILE.parent,
     ):
         path.mkdir(parents=True, exist_ok=True)
