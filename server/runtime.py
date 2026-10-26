@@ -170,6 +170,7 @@ class Runtime:
         self.worker_task: asyncio.Task | None = None
         self.poll_task: asyncio.Task | None = None
         self.scheduler_task: asyncio.Task | None = None
+        self.extractor_task: asyncio.Task | None = None
         self.started = False
         self.started_at = 0.0
         self.max_username: str | None = None
@@ -258,6 +259,17 @@ class Runtime:
         self.worker_task = asyncio.create_task(
             worker_loop(self), name=f"{config.INSTANCE_SLUG}-worker"
         )
+        if config.MEMORY_EXTRACTOR:
+            from server.memory_extract import extractor_loop
+            from server.memory_store import get_store
+
+            try:
+                self.extractor_task = asyncio.create_task(
+                    extractor_loop(get_store(), config.MEMORY_EXTRACT_INTERVAL),
+                    name=f"{config.INSTANCE_SLUG}-extractor",
+                )
+            except Exception as e:
+                logger.warning(f"memory: extractor not started: {e}")
         self.scheduler_task = asyncio.create_task(
             scheduler_loop(self), name=f"{config.INSTANCE_SLUG}-scheduler"
         )
@@ -286,6 +298,12 @@ class Runtime:
             with suppress(asyncio.CancelledError):
                 await self.worker_task
             self.worker_task = None
+
+        if self.extractor_task is not None:
+            self.extractor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.extractor_task
+            self.extractor_task = None
 
         if self.scheduler_task is not None:
             self.scheduler_task.cancel()

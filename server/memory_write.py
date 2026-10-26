@@ -82,6 +82,7 @@ def remember(
     trusted: bool = False,
     chat_id: Optional[str] = None,
     confidence: Optional[float] = None,
+    origin: Optional[str] = None,
 ) -> RememberResult:
     kind = (kind or "").strip().lower()
     if kind not in NODE_KINDS:
@@ -122,7 +123,11 @@ def remember(
     if scope == "chat":
         resolved_scope = f"chat:{chat_id}" if chat_id else "shared"
 
-    origin = "operator" if trusted else "agent"
+    origin = origin or ("operator" if trusted else "agent")
+    if origin not in ("operator", "agent", "web", "tool", "import"):
+        raise MemoryWriteError(
+            "origin: operator, agent, web, tool или import."
+        )
     if confidence is None:
         confidence = 0.9 if trusted else 0.6
 

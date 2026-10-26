@@ -27,7 +27,7 @@ from loguru import logger
 from server import config as app_config
 from server.memory_text import lemmatize
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 3000
 
 # ── DDL ────────────────────────────────────────────────────────────────
@@ -185,6 +185,27 @@ CREATE TRIGGER IF NOT EXISTS episodes_au AFTER UPDATE ON episodes BEGIN
 END;
 """
 
+# v2: review bookkeeping for extractor candidates.  Adding columns (rather than
+# a new table) keeps "list pending facts with their outcome" a single query.
+_SCHEMA_V2 = """
+ALTER TABLE pending_facts ADD COLUMN node_id INTEGER;
+ALTER TABLE pending_facts ADD COLUMN reviewed_at INTEGER;
+"""
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _apply_v2(conn: sqlite3.Connection) -> None:
+    """Add review columns; idempotent so a half-migrated file can be reopened."""
+    existing = _columns(conn, "pending_facts")
+    if "node_id" not in existing:
+        conn.execute("ALTER TABLE pending_facts ADD COLUMN node_id INTEGER")
+    if "reviewed_at" not in existing:
+        conn.execute("ALTER TABLE pending_facts ADD COLUMN reviewed_at INTEGER")
+
+
 _TABLES = (
     "episodes",
     "nodes",
@@ -304,10 +325,13 @@ class MemoryStore:
             self._schema_version = version
             logger.debug(f"memory: schema already v{version}, no migration")
             return
-        # v0 -> v1: create everything.  Later versions append their own step
-        # here and bump SCHEMA_VERSION; never edit a shipped block in place.
+        # Steps are append-only: a fresh database runs every step in order, an
+        # existing one only the missing ones. Never edit a shipped step.
         logger.info(f"memory: migrating schema v{version} -> v{SCHEMA_VERSION}")
-        conn.executescript(_SCHEMA_V1)
+        if version < 1:
+            conn.executescript(_SCHEMA_V1)
+        if version < 2:
+            _apply_v2(conn)
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -493,6 +517,29 @@ class MemoryStore:
             f"name={row['name']!r} edges_closed={closed.rowcount}"
         )
         return True
+
+    # ── Pending candidates ─────────────────────────────────────────
+    def list_pending(self, limit: int = 50, status: str = "pending") -> list:
+        return self.connection.execute(
+            "SELECT * FROM pending_facts WHERE status=? ORDER BY created_at "
+            "LIMIT ?",
+            (status, int(limit)),
+        ).fetchall()
+
+    def reviewed_pending(self, pending_id: int, node_id: Optional[int]) -> bool:
+        """Mark a candidate accepted (with a node) or rejected (without one)."""
+        status = "accepted" if node_id is not None else "rejected"
+        cur = self.connection.execute(
+            "UPDATE pending_facts SET status=?, node_id=?, reviewed_at=? "
+            "WHERE id=? AND status='pending'",
+            (status, node_id, now_ts(), int(pending_id)),
+        )
+        self.connection.commit()
+        logger.info(
+            f"memory: pending {pending_id} → {status}"
+            + (f" (node {node_id})" if node_id is not None else "")
+        )
+        return bool(cur.rowcount)
 
     # ── Diagnostics ────────────────────────────────────────────────
     def stats(self) -> dict[str, int]:

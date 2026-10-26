@@ -118,6 +118,14 @@ MEMORY_WRITE_EPISODES = _env_str("MEMORY_WRITE_EPISODES", "1") not in ("0", "fal
 # episode table (they can be tens of KB each), so they are off by default.
 MEMORY_EPISODE_TOOLS = _env_str("MEMORY_EPISODE_TOOLS", "0") in ("1", "true", "yes")
 
+# Background fact extractor: its own task, its own LLM client, candidates only.
+# Off by default — it costs money and writes facts that return to the prompt.
+MEMORY_EXTRACTOR = _env_str("MEMORY_EXTRACTOR", "0") in ("1", "true", "yes")
+MEMORY_EXTRACT_INTERVAL = float(os.getenv("MEMORY_EXTRACT_INTERVAL", "120"))
+MEMORY_EXTRACT_BATCH = int(os.getenv("MEMORY_EXTRACT_BATCH", "12"))
+# Short replies ("ок", "ага") carry no durable facts and only waste a call.
+MEMORY_EXTRACT_MIN_CHARS = int(os.getenv("MEMORY_EXTRACT_MIN_CHARS", "40"))
+
 STATIC_DIR = _env_path("STATIC_DIR", ROOT / "static")
 VOICE_STATIC_DIR = _env_path("VOICE_STATIC_DIR", STATIC_DIR / "voice")
 PROMPTS_DIR = _env_path("PROMPTS_DIR", ROOT / "system_prompts")
