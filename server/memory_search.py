@@ -156,6 +156,7 @@ class NodeHit:
     # Where the fact came from: provenance is what lets the block mark external
     # knowledge and hide a fact whose file has changed since it was read.
     origin: str = "agent"
+    confidence: float = 0.0
     source: Optional[dict] = None
 
     def as_line(self, index: int) -> str:
@@ -208,6 +209,7 @@ def search_nodes(
             text=str(payload.get("text") or payload.get("note") or ""),
             score=-float(pair["score"]),
             origin=str(row["origin"] or "agent"),
+            confidence=float(row["confidence"]),
             source=source if isinstance(source, dict) else None,
         ))
         if len(hits) >= k:

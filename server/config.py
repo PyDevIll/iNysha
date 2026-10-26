@@ -107,8 +107,10 @@ MEMORY_ITEM_TOKENS = int(os.getenv("MEMORY_ITEM_TOKENS", "60"))
 MEMORY_PROFILE_TOKENS = int(os.getenv("MEMORY_PROFILE_TOKENS", "700"))
 # Memory has its own log sink: retrieval debugging needs DEBUG, while the main
 # agent.log is dominated by transport and turn noise. Both sinks get the lines.
+# TRACE by default so `memory.log` also contains the full block that went into
+# the prompt; agent.log (DEBUG) never receives those lines.
 MEMORY_LOG_FILE = _env_path("MEMORY_LOG_FILE", DATA_DIR / "memory.log")
-MEMORY_LOG_LEVEL = _env_str("MEMORY_LOG_LEVEL", "DEBUG")
+MEMORY_LOG_LEVEL = _env_str("MEMORY_LOG_LEVEL", "TRACE")
 
 # Episodes are the searchable transcript.  They are written from the same hook
 # that already appends message_history.md, so there is only one transcript.

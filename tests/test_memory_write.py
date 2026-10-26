@@ -28,6 +28,7 @@ from server.memory_write import (
     forget,
     looks_like_secret,
     normalize_name,
+    redact_secrets,
     remember,
 )
 
@@ -268,6 +269,19 @@ class SourceWriteTest(Base):
         result = remember(self.store, kind="fact", name="факт", text="просто факт")
         self.assertEqual(result.origin, "agent")
         self.assertEqual(result.source_label, "")
+
+
+class RedactTest(unittest.TestCase):
+    def test_credential_values_are_masked(self) -> None:
+        text = "ключ sk-abcdefghijklmnopqrstuvwxyz и пароль: hunter2hunter2"
+        masked = redact_secrets(text)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", masked)
+        self.assertNotIn("hunter2hunter2", masked)
+        self.assertIn("[redacted]", masked)
+
+    def test_plain_text_is_untouched(self) -> None:
+        text = "лимит ElevenLabs 10000 символов"
+        self.assertEqual(redact_secrets(text), text)
 
 
 class ForgetTest(Base):

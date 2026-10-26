@@ -24,6 +24,7 @@ from server import config as app_config
 from server.memory_search import NodeHit, EpisodeHit, search_episodes, search_nodes
 from server.memory_store import MemoryStore
 from server.memory_text import preview
+from server.memory_write import redact_secrets
 from server.read_sources import label as source_label
 
 HEADER = "## Из памяти"
@@ -78,59 +79,84 @@ def _node_is_current(node: NodeHit) -> bool:
     return True
 
 
+def _trace_note(
+    trace: Optional[list[dict]], kind: str, ident: int, label: str, reason: str
+) -> None:
+    if trace is not None:
+        trace.append({
+            "kind": kind, "id": int(ident),
+            "label": preview(label, 80), "reason": reason,
+        })
+
+
 def render_block(
     nodes: list[NodeHit],
     episodes: list[EpisodeHit],
     budget_tokens: int,
     external_limit: Optional[int] = None,
+    trace: Optional[list[dict]] = None,
 ) -> str:
-    """Render selected memory within ``budget_tokens``; empty when nothing fits."""
+    """Render selected memory within ``budget_tokens``; empty when nothing fits.
+
+    ``trace``, when given, receives one entry per candidate: what was put into
+    the block and why the rest was dropped (``file_changed``, ``external_quota``,
+    ``budget``). Diagnostics only — the prompt never sees it.
+    """
     if not nodes and not episodes:
         return ""
     lines = [HEADER]
     used = _cost(HEADER)
+    added = 0
 
-    def add(line: str) -> bool:
-        nonlocal used
-        cost = _cost(line)
+    def add(section: str, line: str) -> bool:
+        nonlocal used, added
+        header_cost = 0 if section in lines else _cost(section)
+        cost = _cost(line) + header_cost
         if used + cost > budget_tokens:
             return False
+        if header_cost:
+            lines.append(section)
+            used += header_cost
         lines.append(line)
-        used += cost
+        used += _cost(line)
+        added += 1
         return True
 
     if nodes:
-        lines.append("Факты:")
-        used += _cost("Факты:")
         limit = (app_config.MEMORY_BLOCK_EXTERNAL_ITEMS
                  if external_limit is None else external_limit)
         external_used = 0
         for node in nodes:
+            label = f"[{node.kind}] {node.name}"
             # A fact about a file that changed since is worse than no fact.
             if not _node_is_current(node):
+                _trace_note(trace, "node", node.id, label, "file_changed")
                 continue
             external = node.origin in ("web", "tool")
             if external and external_used >= limit:
                 # Operator's own facts always win the scarce block space.
+                _trace_note(trace, "node", node.id, label, "external_quota")
                 continue
             suffix = ""
             if external and node.source:
                 suffix = f" {source_label(node.source)}"
-            if not add(
-                f"- [{node.kind}] {node.name}: {preview(node.text, 180)}{suffix}"
-            ):
+            line = f"- [{node.kind}] {node.name}: {preview(node.text, 180)}{suffix}"
+            if not add("Факты:", line):
+                _trace_note(trace, "node", node.id, label, "budget")
                 break
+            _trace_note(trace, "node", node.id, label, "ok")
             if external:
                 external_used += 1
     if episodes:
-        lines.append("Из истории:")
-        used += _cost("Из истории:")
         for hit in episodes:
             who = "человек" if hit.speaker == "human" else "я"
-            if not add(f"- [{hit.when[:10]}] {who}: {preview(hit.text, 160)}"):
+            line = f"- [{hit.when[:10]}] {who}: {preview(hit.text, 160)}"
+            if not add("Из истории:", line):
+                _trace_note(trace, "episode", hit.id, hit.text, "budget")
                 break
+            _trace_note(trace, "episode", hit.id, hit.text, "ok")
 
-    if len(lines) <= 2:  # заголовок и ничего больше
+    if not added:
         return ""
     return "\n".join(lines)
 
@@ -152,6 +178,48 @@ def _dedupe(episodes: list[EpisodeHit]) -> list[EpisodeHit]:
     return unique
 
 
+def _select_hits(
+    store: MemoryStore, query: str, chat_id: Optional[str]
+) -> tuple[list[NodeHit], list[EpisodeHit]]:
+    nodes = search_nodes(store, query, k=app_config.MEMORY_BLOCK_MAX_ITEMS)
+    episodes = _dedupe(search_episodes(
+        store,
+        query,
+        k=app_config.MEMORY_BLOCK_MAX_ITEMS,
+        chat_id=chat_id,
+    ))
+    return nodes, episodes
+
+
+def explain_block(
+    store: MemoryStore,
+    query: str,
+    chat_id: Optional[str] = None,
+    budget_tokens: Optional[int] = None,
+) -> dict:
+    """What would be injected for ``query`` and why — no usage recording.
+
+    The same selection and rendering as ``build_block``, plus a per-item trace.
+    Used by ``scripts/memory_show.py`` so debugging cannot drift from production.
+    """
+    budget = budget_tokens or app_config.MEMORY_BLOCK_TOKENS
+    started = time.perf_counter()
+    nodes, episodes = _select_hits(store, query, chat_id)
+    trace: list[dict] = []
+    block = render_block(nodes, episodes, budget, trace=trace)
+    return {
+        "query": query,
+        "chat_id": chat_id,
+        "budget": budget,
+        "tokens": _cost(block) if block else 0,
+        "block": block,
+        "nodes": nodes,
+        "episodes": episodes,
+        "trace": trace,
+        "elapsed_ms": (time.perf_counter() - started) * 1000,
+    }
+
+
 def build_block(
     store: MemoryStore,
     query: str,
@@ -164,13 +232,7 @@ def build_block(
     budget = budget_tokens or app_config.MEMORY_BLOCK_TOKENS
     started = time.perf_counter()
     try:
-        nodes = search_nodes(store, query, k=app_config.MEMORY_BLOCK_MAX_ITEMS)
-        episodes = _dedupe(search_episodes(
-            store,
-            query,
-            k=app_config.MEMORY_BLOCK_MAX_ITEMS,
-            chat_id=chat_id,
-        ))
+        nodes, episodes = _select_hits(store, query, chat_id)
         block = render_block(nodes, episodes, budget)
         record_usage(store, nodes, episodes)
     except Exception as e:  # память не имеет права ломать ход
@@ -182,6 +244,13 @@ def build_block(
         f"nodes={len(nodes)} episodes={len(episodes)} "
         f"tokens~{_cost(block)}/{budget} {elapsed_ms:.2f}ms"
     )
+    if block:
+        # Full text only at TRACE: agent.log (DEBUG) stays clean, while
+        # data/memory.log shows exactly what the model received.
+        logger.trace(
+            f"memory: block content tokens~{_cost(block)}/{budget}\n"
+            f"{redact_secrets(block)}"
+        )
     return block
 
 

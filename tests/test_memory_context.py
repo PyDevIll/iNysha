@@ -35,6 +35,7 @@ from server.memory_context import (
 )
 from server.memory_search import EpisodeHit, NodeHit
 from server.memory_store import MemoryStore, close_store
+from loguru import logger
 
 
 def node(node_id: int = 1, name: str = "лимит ElevenLabs",
@@ -435,6 +436,65 @@ class ExternalFactsTest(unittest.TestCase):
             finally:
                 store.close()
                 close_store()
+
+
+class BlockLoggingTest(unittest.TestCase):
+    """Полный блок уходит в memory.log на TRACE, но не в agent.log (DEBUG)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = MemoryStore(Path(self._tmp.name) / "memory.db")
+        self.store.upsert_node(
+            kind="fact", name="лимит ElevenLabs", name_norm="лимит elevenlabs",
+            node_text="10000 символов в месяц",
+            data=json.dumps({"text": "10000 символов в месяц"},
+                            ensure_ascii=False),
+            origin="operator", confidence=0.9,
+        )
+
+    def tearDown(self) -> None:
+        self.store.close()
+        close_store()
+        self._tmp.cleanup()
+
+    def capture(self, level: str) -> tuple[int, list[str]]:
+        messages: list[str] = []
+        sink = logger.add(lambda m: messages.append(m.record["message"]),
+                          level=level)
+        return sink, messages
+
+    def test_full_block_is_logged_at_trace(self) -> None:
+        sink, messages = self.capture("TRACE")
+        try:
+            block = build_block(self.store, "лимит")
+        finally:
+            logger.remove(sink)
+        joined = "\n".join(messages)
+        self.assertIn("block content", joined)
+        self.assertIn("лимит ElevenLabs", joined)
+        self.assertIn(block.strip().splitlines()[-1][:40], joined)
+
+    def test_block_content_is_not_debug_level(self) -> None:
+        sink, messages = self.capture("DEBUG")
+        try:
+            build_block(self.store, "лимит")
+        finally:
+            logger.remove(sink)
+        self.assertNotIn("block content", "\n".join(messages))
+
+    def test_secrets_are_redacted_in_the_log(self) -> None:
+        self.store.add_episode(
+            chat_id="1", speaker="human", kind="message", ts=1_790_000_000,
+            text="ключ sk-abcdefghijklmnopqrstuvwxyz положила в downloads",
+        )
+        sink, messages = self.capture("TRACE")
+        try:
+            build_block(self.store, "ключ")
+        finally:
+            logger.remove(sink)
+        joined = "\n".join(messages)
+        self.assertIn("[redacted]", joined)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", joined)
 
 
 if __name__ == "__main__":

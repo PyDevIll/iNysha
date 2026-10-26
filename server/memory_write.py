@@ -69,6 +69,23 @@ def looks_like_secret(text: str) -> Optional[str]:
     return None
 
 
+def redact_secrets(text: str) -> str:
+    """Mask credential-looking fragments before text reaches a log.
+
+    Episodes come from real conversations: a block logged for debugging may
+    contain a key that the operator once pasted. Memory refuses to *store*
+    secrets, but logging is a different path and needs its own guard.
+    """
+    result = text or ""
+    for pattern in _SECRET_PATTERNS:
+        result = pattern.sub("[redacted]", result)
+    result = _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: match.group(0).replace(match.group(1), "[redacted]"),
+        result,
+    )
+    return result
+
+
 @dataclass
 class RememberResult:
     node_id: int
