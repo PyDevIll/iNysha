@@ -12,6 +12,7 @@ Queries go through ``server.memory_text.fts_query``: lemmas first (so
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -143,6 +144,103 @@ def search_episodes(
         f"{elapsed_ms:.2f}ms"
     )
     return hits
+
+
+@dataclass
+class NodeHit:
+    id: int
+    kind: str
+    name: str
+    text: str
+    score: float
+
+    def as_line(self, index: int) -> str:
+        return f"{index}. [{self.kind}] {self.name}: {preview(self.text, SNIPPET_CHARS)}"
+
+
+def _node_text(row) -> str:
+    """Node body: the ``text`` field of its JSON payload, else the raw data."""
+    try:
+        payload = json.loads(row["data"] or "{}")
+        if isinstance(payload, dict):
+            return str(payload.get("text") or payload.get("note") or "")
+    except (ValueError, TypeError):
+        pass
+    return ""
+
+
+def search_nodes(
+    store: MemoryStore,
+    query: str,
+    k: int = DEFAULT_K,
+    scope: Optional[str] = None,
+) -> list[NodeHit]:
+    """Search remembered facts (``nodes``), newest-and-best first."""
+    k = max(1, min(int(k), 50))
+    match = fts_query(query)
+    if not match:
+        return []
+    pairs = store.connection.execute(
+        "SELECT rowid, bm25(nodes_fts) AS score FROM nodes_fts "
+        "WHERE nodes_fts MATCH ? ORDER BY score LIMIT ?",
+        (match, k * 4),
+    ).fetchall()
+    hits: list[NodeHit] = []
+    for pair in pairs:
+        row = store.get_node(int(pair["rowid"]))
+        if row is None or row["status"] == "retired":
+            continue
+        if scope is not None and row["scope"] not in (scope, "shared"):
+            continue
+        hits.append(NodeHit(
+            id=int(row["id"]),
+            kind=str(row["kind"]),
+            name=str(row["name"]),
+            text=_node_text(row),
+            score=-float(pair["score"]),
+        ))
+        if len(hits) >= k:
+            break
+    logger.debug(f"memory: node search q={preview(query, 40)!r} hits={len(hits)}")
+    return hits
+
+
+def format_all(
+    query: str,
+    nodes: list[NodeHit],
+    episodes: list[EpisodeHit],
+    note: str = "",
+) -> str:
+    """Facts first (they are short and vetted), then transcript fragments."""
+    if not nodes and not episodes:
+        return f"По запросу «{preview(query, 80)}» ничего не найдено."
+    lines: list[str] = []
+    budget = app_config.MEMORY_BLOCK_TOKENS
+    used = 0
+
+    def append(line: str) -> bool:
+        nonlocal used
+        cost = max(1, len(line) // 3)
+        if used + cost > budget:
+            return False
+        lines.append(line)
+        used += cost
+        return True
+
+    header = f"Найдено: фактов {len(nodes)}, фрагментов {len(episodes)}"
+    append(f"{header} (запрос: «{preview(query, 80)}»{note}):")
+    if nodes:
+        append("Из памяти (факты):")
+        for index, node in enumerate(nodes, start=1):
+            if not append(node.as_line(index)):
+                break
+    if episodes:
+        append("Из истории:")
+        for index, hit in enumerate(episodes, start=1):
+            if not append(hit.as_line(index)):
+                append("… обрезано лимитом памяти")
+                break
+    return "\n".join(lines)
 
 
 def format_hits(query: str, hits: list[EpisodeHit], note: str = "") -> str:

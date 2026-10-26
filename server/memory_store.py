@@ -402,6 +402,98 @@ class MemoryStore:
         )
         return int(cur.lastrowid) if cur.lastrowid else None
 
+    # ── Nodes ──────────────────────────────────────────────────────
+    def find_node(
+        self, kind: str, name_norm: str, scope: str = "shared"
+    ) -> Optional[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM nodes WHERE kind=? AND name_norm=? AND scope=?",
+            (kind, name_norm, scope),
+        ).fetchone()
+
+    def upsert_node(
+        self,
+        *,
+        kind: str,
+        name: str,
+        name_norm: str,
+        node_text: str,
+        data: str = "{}",
+        scope: str = "shared",
+        origin: str = "agent",
+        confidence: float = 0.6,
+    ) -> tuple[int, bool]:
+        """Create or refresh one entity; returns ``(node_id, created)``.
+
+        Re-remembering the same ``(kind, name_norm, scope)`` updates the node in
+        place and revives it if it had been retired — memory is not append-only
+        for the same fact, only for its history (``edges.valid_to``).
+        """
+        now = now_ts()
+        lemma_text = lemmatize(f"{name} {node_text}")
+        existing = self.find_node(kind, name_norm, scope)
+        if existing is None:
+            cur = self.connection.execute(
+                "INSERT INTO nodes(kind, name, name_norm, data, node_text,"
+                " lemma_text, scope, origin, confidence, status,"
+                " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,'active',?,?)",
+                (
+                    kind, name, name_norm, data, node_text, lemma_text,
+                    scope, origin, float(confidence), now, now,
+                ),
+            )
+            self.connection.commit()
+            node_id = int(cur.lastrowid)
+            logger.debug(
+                f"memory: node created id={node_id} kind={kind} "
+                f"name={name!r} scope={scope} origin={origin}"
+            )
+            return node_id, True
+
+        node_id = int(existing["id"])
+        self.connection.execute(
+            "UPDATE nodes SET name=?, data=?, node_text=?, lemma_text=?,"
+            " origin=?, confidence=?, status='active', updated_at=? WHERE id=?",
+            (
+                name, data, node_text, lemma_text, origin,
+                max(float(existing["confidence"]), float(confidence)),
+                now, node_id,
+            ),
+        )
+        self.connection.commit()
+        logger.debug(
+            f"memory: node updated id={node_id} kind={kind} name={name!r} "
+            f"prev_status={existing['status']}"
+        )
+        return node_id, False
+
+    def get_node(self, node_id: int) -> Optional[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM nodes WHERE id=?", (node_id,)
+        ).fetchone()
+
+    def retire_node(self, node_id: int) -> bool:
+        """Soft-delete: keep the row, close its live edges, hide from search."""
+        now = now_ts()
+        row = self.get_node(node_id)
+        if row is None:
+            return False
+        self.connection.execute(
+            "UPDATE nodes SET status='retired', updated_at=? WHERE id=?",
+            (now, node_id),
+        )
+        closed = self.connection.execute(
+            "UPDATE edges SET valid_to=? WHERE (src=? OR dst=?) "
+            "AND valid_to IS NULL",
+            (now, node_id, node_id),
+        )
+        self.connection.commit()
+        logger.info(
+            f"memory: node retired id={node_id} kind={row['kind']} "
+            f"name={row['name']!r} edges_closed={closed.rowcount}"
+        )
+        return True
+
     # ── Diagnostics ────────────────────────────────────────────────
     def stats(self) -> dict[str, int]:
         """Row counts per table — cheap enough for a health endpoint."""

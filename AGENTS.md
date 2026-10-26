@@ -41,6 +41,15 @@ iНюша / Deliria is a single-agent Python assistant. The production entry poi
 - `ContextPool.build_llm_messages()` is the single LLM prompt-assembly path; `Agent` supplies the system/base prompts, then repairs tool pairs and validates. It also sets `base_prompt_tokens`, so overflow/compression accounting includes static prompts. Do not add a second assembler or read `ContextPool` private memory layers from `Agent`.
 - Persistent state: `DATA_DIR/emergency_save.json`, `DATA_DIR/last_compression.txt`, `DATA_DIR/persistent_memory.json`, `DATA_DIR/scheduler_tasks.json`. `last_compression.txt` is seeded exactly once into `_compressed_dicts`; do not pass it through `last_memory`, which recreates a duplicate system/base entry.
 
+## Long-term memory (SQLite)
+
+- `DATA_DIR/memory.db` (schema v1, FTS5) is the episodic + semantic store; `DATA_DIR/memory.log` is its own log sink. The profile file `persistent_memory.json` stays the always-in-prompt block and gets only short facts and pointers — long blocks live in `DATA_DIR/lessons.md`, `ideas.md`, `lore_*.md`, `servers.md`.
+- Episodes are written from the same hook as `message_history.md` (`ContextPool.append`/`append_assistant_message`, `save=True`) via `server/memory_episodes.EpisodeLog`; there is no second transcript. Writing is best effort — a broken DB must never break a turn — and `resolve_db_path()` keeps a pool with an explicit `data_dir` off the live database.
+- `server/memory_text.py` owns normalisation, pymorphy3 lemmatisation and the safe FTS5 `MATCH` builder. Raw user text must never reach `MATCH` (punctuation is FTS5 syntax). Query lemmas are expanded through the small `SYNONYMS` map; add an entry only for a measured golden-set miss.
+- `server/memory_search.py` is the single read path (`search_nodes` + `search_episodes`); rank and slice inside the FTS table before joining. The `memory_search` tool is allowlisted for direct voice use; `memory_remember`/`memory_forget` are not.
+- `server/memory_write.py` is the only path that creates facts: it validates kind/name/text, refuses credential-looking text, derives `origin`/`confidence` from request trust, and forgets with `status='retired'` (never `DELETE`). Everything stored there returns to the prompt forever, so the rules live in code, not in prompt wording.
+- Verify with `scripts/memory_eval.py` (`--auto` regression, `--golden` real questions) before changing ranking, prompts or the block budget. `scripts/import_history.py` (idempotent, `--apply`) is the only way history enters the DB.
+
 ## Instance configuration
 
 - `server/config.py` is the single source of truth for instance identity (`INSTANCE_NAME`, `INSTANCE_SLUG`, `AGENT_NAME`, `AGENT_DISPLAY_NAME`, `AGENT_PERSONA_NAME`), paths (`DATA_DIR`, `STATIC_DIR`, `PROMPTS_DIR`, TTS/scheduler/marker files), the MAX webhook path (`MAX_WEBHOOK_PATH` / `MAX_WEBHOOK_ALIAS_PATH`) and `SECRET_HEADER`. Do not hardcode those in modules.

@@ -182,7 +182,8 @@ class ToolTest(SearchTestBase):
 
         self.add("Рестарт сервиса прошёл успешно")
         text = asyncio.run(self.tools.memory_search("рестарт"))
-        self.assertIn("Найдено 1", text)
+        self.assertIn("фрагментов 1", text)
+        self.assertIn("Из истории:", text)
 
     def test_tool_rejects_empty_query(self) -> None:
         import asyncio
