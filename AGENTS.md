@@ -41,6 +41,14 @@ iНюша / Deliria is a single-agent Python assistant. The production entry poi
 - `ContextPool.build_llm_messages()` is the single LLM prompt-assembly path; `Agent` supplies the system/base prompts, then repairs tool pairs and validates. It also sets `base_prompt_tokens`, so overflow/compression accounting includes static prompts. Do not add a second assembler or read `ContextPool` private memory layers from `Agent`.
 - Persistent state: `DATA_DIR/emergency_save.json`, `DATA_DIR/last_compression.txt`, `DATA_DIR/persistent_memory.json`, `DATA_DIR/scheduler_tasks.json`. `last_compression.txt` is seeded exactly once into `_compressed_dicts`; do not pass it through `last_memory`, which recreates a duplicate system/base entry.
 
+## cli-agent.py (stateless batch runs)
+
+- `cli-agent.py` is the extracted `Agent.run()` loop for one-shot batch steps: one base prompt, one run prompt, N context files, one output file. It is the intended way for iNysha to generate one step of a pipeline (see `data/newsfeed/README.md`) through `exec_shell`.
+- It imports only `builtin_tools.fs_tools` / `edit_tools` / `additional_tools`. `tool_registry.get_registry()` is deliberately not used: it auto-registers max/vision/memory/tavily and pulls `server.*`. The tool surface is the hardcoded `TOOL_NAMES` allowlist (fs tree/read/stat/append/repair_encoding, six edit tools, `exec_shell`, `exec_python`).
+- No `ContextPool`, no memory, no compression, no queue/router/voice policy, no hot reload, no crash dumps, no rate limiting. All state is process-local and disappears on exit; it touches `data/` only through the caller's `--output_file`.
+- Default base prompt is `system_prompts/identity.md` (persona only, no `{{...}}` placeholders — there is no renderer). `--temperature` defaults to 1.3 for creative output; thinking is on unless `--no-reasoning`.
+- Tests: `tests/test_cli_agent.py` loads the module through `importlib` (hyphen in the filename) and fakes the LLM client; keep it network-free.
+
 ## Long-term memory (SQLite)
 
 - `DATA_DIR/memory.db` (schema v1, FTS5) is the episodic + semantic store; `DATA_DIR/memory.log` is its own log sink. The profile file `persistent_memory.json` stays the always-in-prompt block and gets only short facts and pointers — long blocks live in `DATA_DIR/lessons.md`, `ideas.md`, `lore_*.md`, `servers.md`.
