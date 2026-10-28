@@ -46,6 +46,80 @@ def _delivery_failure(reason: Optional[str]) -> dict[str, Any]:
 # (keep them as they are; included here for completeness)
 # ----------------------------------------------------------------------
 
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+
+async def _send_image_attachment(
+    chat_id: int, path: Path, caption: str = ""
+) -> Optional[dict[str, Any]]:
+    """Отправить картинку как вложение-фото (превью), а не как документ.
+
+    MAX требует свой путь загрузки для изображений:
+    ``POST /uploads?type=image`` -> CDN возвращает ``{"photos": {"0": {"token": ...}}}``;
+    затем ``POST /messages`` с attachment ``{"type": "image", "payload": {"token", "photo_id": 0}}``.
+    Возвращает ``None``, если отправить не удалось, — тогда вызывающий
+    откатывается на обычный документ.
+    """
+    import asyncio
+    import os
+
+    import httpx
+
+    token = os.environ.get("MAX_BOT_TOKEN", "")
+    if not token:
+        return None
+
+    data = await asyncio.to_thread(path.read_bytes)
+    mime = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+
+    try:
+        async with httpx.AsyncClient(
+            base_url="https://botapi.max.ru",
+            headers={"Authorization": token},
+            timeout=30.0,
+        ) as client:
+            info_resp = await client.post("/uploads", params={"type": "image"})
+            info_resp.raise_for_status()
+            upload_url = info_resp.json().get("url")
+            if not upload_url:
+                return None
+
+        await asyncio.sleep(1)
+
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as cdn:
+            cdn_resp = await cdn.post(
+                upload_url, files={"data": (path.name, data, mime)}
+            )
+            cdn_resp.raise_for_status()
+
+        try:
+            photo_token = cdn_resp.json()["photos"]["0"]["token"]
+        except (KeyError, ValueError):
+            return None
+
+        payload: dict[str, Any] = {
+            "text": caption or "",
+            "attachments": [
+                {"type": "image", "payload": {"token": photo_token, "photo_id": 0}}
+            ],
+        }
+        async with httpx.AsyncClient(
+            base_url="https://botapi.max.ru",
+            headers={"Authorization": token},
+            timeout=30.0,
+        ) as client:
+            send_resp = await client.post(
+                "/messages", params={"chat_id": chat_id}, json=payload
+            )
+            send_resp.raise_for_status()
+            message = sent_message(send_resp.json())
+        if message:
+            return {"ok": True, "result": message}
+        return None
+    except Exception as e:  # noqa: BLE001 — падать нельзя, есть фолбэк
+        logger.warning(f"MAX tool: image attachment failed, fallback to document: {e}")
+        return None
+
 async def max_send_file(
     absolute_path: str,
     chat_id: str,
@@ -74,6 +148,13 @@ async def max_send_file(
     bot = _get_bot_from_registry()
     if bot is None:
         return {"ok": False, "error": "MAX bot not available"}
+
+    # Images should arrive as inline previews, not downloadable documents.
+    # MAX image upload: /uploads?type=image -> CDN returns {"photos":{"0":{"token":...}}}
+    if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+        image_result = await _send_image_attachment(int(chat_id), path, caption)
+        if image_result is not None:
+            return image_result
 
     logger.info(f"MAX tool: sending file {path} to chat_id={chat_id}")
     result = await bot.send_document(int(chat_id), str(path), caption=caption)
@@ -326,7 +407,18 @@ async def max_mark_replied(
     )
     return {
         "ok": True,
-        "result": {"chat_id": chat_key, "marked": True, "reason": reason or ""},
+        "result": {
+            "chat_id": chat_key,
+            "marked": True,
+            "reason": reason or "",
+            "hint": (
+                "Чат уже помечен как отвеченный, финальный ответ в него подавлен. "
+                "Немедленно заверши ход с ПУСТЫМ финальным ответом — ни слова, ни пробела, "
+                "ни отчёта, ни markdown. Любой текст здесь сломает тишину, ради которой "
+                "вызван этот инструмент. Идеальный ответ — ноль выходных токенов."
+            ),
+            "final_answer": "",
+        },
     }
 
 
