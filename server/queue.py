@@ -17,6 +17,9 @@ class Request:
     text: str
     source: str = "unknown"
     chat_id: str | None = None
+    # Канал, под постом которого оставлен комментарий (MAX). Reply target и
+    # max_send_message используют его, чтобы не создать новый пост в канале.
+    post_id: str | None = None
     client_id: str | None = None
     # Exact voice WebSocket session that originated a voice/tool-result turn.
     # ``client_id`` alone is ambiguous when one client has multiple sessions.

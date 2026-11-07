@@ -148,8 +148,10 @@ curl -s https://platform-api2.max.ru/subscriptions \
 Expected:
 
 ```json
-{"subscriptions":[{"url":"https://functions.yandexcloud.net/d4e8obdfp90a4tbbr6rp","update_types":["message_created"]}]}
+{"subscriptions":[{"url":"https://functions.yandexcloud.net/d4e8obdfp90a4tbbr6rp","update_types":["message_created","comment_created"]}]}
 ```
+
+`comment_created` обязателен: без него комментарии в канале не доходят до бота, и он не может ответить в обсуждении.
 
 To recreate it (this replaces the existing subscription):
 
@@ -160,7 +162,7 @@ SECRET=$(grep -m1 '^MAX_WEBHOOK_SECRET=' .env | cut -d= -f2-)
 curl -s -X POST https://platform-api2.max.ru/subscriptions \
   -H "Authorization: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"url\":\"https://functions.yandexcloud.net/d4e8obdfp90a4tbbr6rp\",\"update_types\":[\"message_created\"],\"secret\":\"$SECRET\"}"
+  -d "{\"url\":\"https://functions.yandexcloud.net/d4e8obdfp90a4tbbr6rp\",\"update_types\":[\"message_created\",\"comment_created\"],\"secret\":\"$SECRET\"}"
 ```
 
 ## Test 1 — function → VDS

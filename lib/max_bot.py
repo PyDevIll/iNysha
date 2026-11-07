@@ -482,6 +482,42 @@ class MAXBotApi:
         )
         return result
 
+    async def send_comment_to_post(
+        self,
+        post_id: str | int,
+        text: str,
+        extra: Optional[Dict] = None,
+        disable_link_preview: bool = False,
+    ) -> Dict:
+        """POST /messages/{post_id}/comments — комментарий к посту канала.
+
+        ``post_id`` — это ``mid`` поста, а не комментария (в апдейте он лежит
+        в ``message.recipient.post_id``).  Комментарии не поддерживают
+        вложения, поэтому любые ``attachments`` из ``extra`` отбрасываются:
+        иначе MAX отклонит весь запрос, и ответ не дойдёт вообще.
+        """
+        body: Dict[str, Any] = {"text": text}
+        if extra:
+            body.update(
+                {key: value for key, value in extra.items() if key != "attachments"}
+            )
+        query: Dict[str, Any] = {}
+        if disable_link_preview:
+            query["disable_link_preview"] = "true"
+        logger.debug(
+            f"[send_comment_to_post] post_id={post_id} text={_brief(text, 120)!r} "
+            f"body={_brief(_redact(body))}"
+        )
+        logger.trace(f"[send_comment_to_post] full body={_redact(body)}")
+        result = await self._request(
+            "POST",
+            f"/messages/{post_id}/comments",
+            query=query or None,
+            body=body,
+        )
+        logger.debug(f"[send_comment_to_post] result={_brief(result)}")
+        return result
+
 
     async def get_messages(
         self,
@@ -746,6 +782,34 @@ class MAXBot:
         if not self._reasoning_chat_id or not text:
             return
         await self.send_message(self._reasoning_chat_id, f"🧠 *Reasoning:*\n{text[:3800]}")
+
+    async def send_comment(self, post_id: str | int, text: str) -> Optional[Dict[str, Any]]:
+        """Ответить комментарием под постом канала.
+
+        Используется вместо ``send_message``, когда входящий апдейт пришёл из
+        комментариев канала: ``POST /messages`` создал бы новый пост в канале,
+        а не ответ в обсуждении.
+
+        Комментарии не несут вложений и имеют тот же лимит в 4000 символов,
+        что и сообщения.
+        """
+        if not text or not post_id:
+            return None
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n... (truncated)"
+        result = await self._api.send_comment_to_post(
+            post_id,
+            text,
+            {"format": "markdown"},
+        )
+        message = sent_message(result)
+        if not message and not delivery_error(result, ""):
+            # API ответил без message — повторяем без markdown один раз.
+            result = await self._api.send_comment_to_post(post_id, text)
+            message = sent_message(result)
+        if message:
+            return {"ok": True, "result": message}
+        return {"ok": False, "error": delivery_error(result)}
 
     async def send_reply(self, chat_id: int, text: str) -> None:
         """Reply to a user in their chat."""

@@ -1,9 +1,10 @@
 """MAX messenger source: webhook -> parse/download/transcribe -> per-chat batch.
 
 Каждое обновление разбирается сразу (скачивание вложений, транскрипция), но
-результат не уходит в очередь немедленно: текст копится в буфере своего чата,
-и через ``MAX_DEFER_SECONDS`` тишины все накопленные сообщения чата уходят
-одним ``Request``. Разные чаты никогда не склеиваются.
+результат не уходит в очередь немедленно: текст копится в буфере своего чата
+(а для комментариев канала — в буфере своего поста), и через
+``MAX_DEFER_SECONDS`` тишины все накопленные сообщения уходят одним
+``Request``. Разные чаты и посты никогда не склеиваются.
 """
 
 from __future__ import annotations
@@ -39,8 +40,12 @@ _background: set[asyncio.Task] = set()
 
 @dataclass
 class _ChatBatch:
-    """Сообщения одного чата, ещё не отданные воркеру."""
+    """Сообщения одного треда (чат или пост канала), ещё не отданные воркеру."""
 
+    # Чат, куда уйдёт ответ. Для комментария канала это id канала.
+    chat_id: str = ""
+    # Пост канала, если сообщения пришли из комментариев под ним.
+    post_id: str | None = None
     messages: list[str] = field(default_factory=list)
     chars: int = 0
     # Доверие считается по каждому сообщению отдельно: в группе чужое
@@ -53,13 +58,24 @@ class _ChatBatch:
         return bool(self.trust_flags) and all(self.trust_flags)
 
 
-# chat_id -> активный буфер сообщений; чаты независимы друг от друга.
+def _thread_key(chat_id: str, post_id: str | None) -> str:
+    """Ключ буфера: обычный чат или обсуждение конкретного поста канала.
+
+    Комментарии разных постов нельзя склеивать в одну пачку: ответ уходит
+    ``POST /messages/{post_id}/comments`` и у него может быть только один
+    ``post_id``.
+    """
+    chat_id = str(chat_id)
+    return f"{chat_id}#{post_id}" if post_id else chat_id
+
+
+# thread key (chat_id или "chat_id#post_id") -> активный буфер сообщений.
 _batches: dict[str, _ChatBatch] = {}
 # Rate-limit: chat_id -> список меток времени последних сообщений.
 _rate: dict[str, list[float]] = {}
-# chat_id -> полные пачки, ждущие, пока освободится занятый чат.
+# thread key -> полные пачки, ждущие, пока освободится занятый тред.
 _backlog: dict[str, list[_ChatBatch]] = {}
-# Чаты, для которых запрос уже стоит в очереди или обрабатывается воркером.
+# Треды, для которых запрос уже стоит в очереди или обрабатывается воркером.
 _inflight: set[str] = set()
 
 
@@ -238,13 +254,18 @@ async def _handle_update(update: dict[str, Any]) -> None:
 def _extract(update: dict[str, Any]) -> dict[str, Any]:
     message = update.get("message") or {}
     body = message.get("body") or {}
+    recipient = message.get("recipient") or {}
 
     chat_id = update.get("chat_id")
     if not chat_id:
-        recipient = message.get("recipient") or {}
         chat_id = recipient.get("chat_id")
     if not chat_id:
         chat_id = update.get("user_id")
+
+    # Комментарий канала: recipient.post_id — это mid поста, а не комментария.
+    # Именно он нужен для POST /messages/{post_id}/comments.
+    post_id = recipient.get("post_id") or update.get("post_id")
+    message_id = body.get("mid") or message.get("mid") or update.get("message_id")
 
     sender = message.get("sender") or {}
     user_id = sender.get("user_id") or update.get("user_id")
@@ -252,6 +273,9 @@ def _extract(update: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "chat_id": chat_id,
+        "post_id": str(post_id) if post_id not in (None, "") else None,
+        "message_id": str(message_id) if message_id not in (None, "") else None,
+        "chat_type": recipient.get("chat_type"),
         "text": body.get("text") or "",
         "attachments": body.get("attachments") or [],
         "user_id": user_id,
@@ -275,51 +299,60 @@ def _attachment_summary(attachment: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _has_pending(chat_id: str) -> bool:
-    """Есть ли у чата что отдавать: активный буфер или готовый backlog."""
-    batch = _batches.get(chat_id)
-    return bool(_backlog.get(chat_id)) or bool(batch and batch.messages)
+def _new_batch(chat_id: str, post_id: str | None) -> _ChatBatch:
+    return _ChatBatch(chat_id=str(chat_id), post_id=post_id)
 
 
-def _schedule_flush(chat_id: str, delay: float | None = None) -> None:
-    """(Пере)завести таймер тишины для чата."""
-    batch = _batches.get(chat_id)
+def _has_pending(key: str) -> bool:
+    """Есть ли у треда что отдавать: активный буфер или готовый backlog."""
+    batch = _batches.get(key)
+    return bool(_backlog.get(key)) or bool(batch and batch.messages)
+
+
+def _schedule_flush(key: str, delay: float | None = None) -> None:
+    """(Пере)завести таймер тишины для треда."""
+    batch = _batches.get(key)
     if batch is None:
-        if not _backlog.get(chat_id):
+        backlog = _backlog.get(key) or []
+        if not backlog:
             return
-        batch = _batches[chat_id] = _ChatBatch()
+        # Заглушка для таймера: при сбросе первым всё равно возьмётся backlog.
+        ref = backlog[0]
+        batch = _batches[key] = _new_batch(ref.chat_id, ref.post_id)
     if batch.timer is not None:
         batch.timer.cancel()
         batch.timer = None
-    if not _has_pending(chat_id):
+    if not _has_pending(key):
         return
     if delay is None:
         delay = config.MAX_DEFER_SECONDS
     loop = asyncio.get_running_loop()
-    batch.timer = loop.call_later(max(0.0, delay), _on_flush_timer, chat_id)
+    batch.timer = loop.call_later(max(0.0, delay), _on_flush_timer, key)
 
 
-def _on_flush_timer(chat_id: str) -> None:
-    batch = _batches.get(chat_id)
+def _on_flush_timer(key: str) -> None:
+    batch = _batches.get(key)
     if batch is None:
-        if not _backlog.get(chat_id):
+        backlog = _backlog.get(key) or []
+        if not backlog:
             return
-        batch = _batches[chat_id] = _ChatBatch()
+        ref = backlog[0]
+        batch = _batches[key] = _new_batch(ref.chat_id, ref.post_id)
     batch.timer = None
-    if not _has_pending(chat_id):
+    if not _has_pending(key):
         return
     task = asyncio.create_task(
-        _flush_batch_safe(chat_id, reason="тишина"), name=f"max-batch-{chat_id}"
+        _flush_batch_safe(key, reason="тишина"), name=f"max-batch-{key}"
     )
     _background.add(task)
     task.add_done_callback(_background.discard)
 
 
-async def _flush_batch_safe(chat_id: str, reason: str) -> None:
+async def _flush_batch_safe(key: str, reason: str) -> None:
     try:
-        await _flush_batch(chat_id, reason)
+        await _flush_batch(key, reason)
     except Exception:
-        logger.exception(f"MAX: не удалось отправить пачку чата {chat_id}")
+        logger.exception(f"MAX: не удалось отправить пачку {key}")
 
 
 def _append_to_batch(batch: _ChatBatch, text: str, trusted: bool) -> None:
@@ -341,52 +374,59 @@ def _batch_would_overflow(batch: _ChatBatch, text: str) -> bool:
     )
 
 
-def _park_batch(chat_id: str, batch: _ChatBatch) -> None:
-    """Убрать пачку в backlog чата, не оставив висящий таймер тишины."""
+def _park_batch(key: str, batch: _ChatBatch) -> None:
+    """Убрать пачку в backlog треда, не оставив висящий таймер тишины."""
     if batch.timer is not None:
         batch.timer.cancel()
         batch.timer = None
-    _backlog.setdefault(chat_id, []).append(batch)
+    _backlog.setdefault(key, []).append(batch)
 
 
-async def _buffer_message(chat_id: str, text: str, trusted: bool) -> None:
-    """Добавить готовый текст в пачку чата; переполнение сбрасывается сразу."""
-    batch = _batches.get(chat_id)
+async def _buffer_message(
+    chat_id: str,
+    text: str,
+    trusted: bool,
+    post_id: str | None = None,
+) -> None:
+    """Добавить готовый текст в пачку треда; переполнение сбрасывается сразу."""
+    chat_id = str(chat_id)
+    key = _thread_key(chat_id, post_id)
+    batch = _batches.get(key)
     if batch is None:
-        batch = _batches[chat_id] = _ChatBatch()
+        batch = _batches[key] = _new_batch(chat_id, post_id)
 
-    # Пока по этому чату ещё отвечает воркер, отдать пачку нельзя: копим
+    # Пока по этому треду ещё отвечает воркер, отдать пачку нельзя: копим
     # сообщения, но не даём пачке выйти за лимиты — полная уходит в backlog
-    # и будет отправлена следующей, как только чат освободится.
-    if chat_id in _inflight:
+    # и будет отправлена следующей, как только тред освободится.
+    if key in _inflight:
         if batch.messages and _batch_would_overflow(batch, text):
-            _park_batch(chat_id, batch)
-            batch = _batches[chat_id] = _ChatBatch()
+            _park_batch(key, batch)
+            batch = _batches[key] = _new_batch(chat_id, post_id)
         _append_to_batch(batch, text, trusted)
         logger.debug(
-            f"MAX: чат {chat_id} занят, {len(batch.messages)} сообщ. "
+            f"MAX: тред {key} занят, {len(batch.messages)} сообщ. "
             "ждут следующей пачки"
         )
         if (
             len(batch.messages) >= config.MAX_BATCH_MESSAGES
             or batch.chars >= config.MAX_BATCH_CHARS
         ):
-            _park_batch(chat_id, batch)
-            _batches[chat_id] = _ChatBatch()
+            _park_batch(key, batch)
+            _batches[key] = _new_batch(chat_id, post_id)
         return
 
     # Не влезает в текущую пачку — сначала отдаём её, остаток копим заново.
     if batch.messages and _batch_would_overflow(batch, text):
         logger.info(
-            f"MAX: пачка чата {chat_id} заполнена "
+            f"MAX: пачка треда {key} заполнена "
             f"({len(batch.messages)} сообщ., {batch.chars} симв.), "
             "сбрасываю её до лимита"
         )
-        await _flush_batch(chat_id, reason="переполнение")
+        await _flush_batch(key, reason="переполнение")
         # После успешного сброса пачки в буфере её уже нет — заводим новую.
-        if _batches.get(chat_id) is None:
-            _batches[chat_id] = _ChatBatch()
-        batch = _batches[chat_id]
+        if _batches.get(key) is None:
+            _batches[key] = _new_batch(chat_id, post_id)
+        batch = _batches[key]
 
     _append_to_batch(batch, text, trusted)
 
@@ -395,56 +435,58 @@ async def _buffer_message(chat_id: str, text: str, trusted: bool) -> None:
         or batch.chars >= config.MAX_BATCH_CHARS
     ):
         logger.info(
-            f"MAX: пачка чата {chat_id} достигла лимита "
+            f"MAX: пачка треда {key} достигла лимита "
             f"({len(batch.messages)} сообщ., {batch.chars} симв.), "
             "сбрасываю сразу"
         )
-        await _flush_batch(chat_id, reason="переполнение")
+        await _flush_batch(key, reason="переполнение")
         return
 
-    if chat_id not in _inflight:
-        _schedule_flush(chat_id)
+    if key not in _inflight:
+        _schedule_flush(key)
 
 
-def _take_next_batch(chat_id: str) -> _ChatBatch | None:
+def _take_next_batch(key: str) -> _ChatBatch | None:
     """Следующая пачка: сначала backlog (порядок), затем активный буфер."""
-    backlog = _backlog.get(chat_id)
+    backlog = _backlog.get(key)
     if backlog:
         batch = backlog.pop(0)
         if not backlog:
-            _backlog.pop(chat_id, None)
+            _backlog.pop(key, None)
         return batch
-    batch = _batches.pop(chat_id, None)
+    batch = _batches.pop(key, None)
     if batch is None or not batch.messages:
         return None
     return batch
 
 
-async def _flush_batch(chat_id: str, reason: str = "тишина") -> Request | None:
-    """Отдать накопленную пачку чата в очередь одним ``Request``."""
-    batch = _batches.get(chat_id)
+async def _flush_batch(key: str, reason: str = "тишина") -> Request | None:
+    """Отдать накопленную пачку треда в очередь одним ``Request``."""
+    batch = _batches.get(key)
     if batch is not None and batch.timer is not None:
         batch.timer.cancel()
         batch.timer = None
 
-    if chat_id in _inflight:
-        # Предыдущий запрос этого чата ещё в очереди или в работе: новые
+    if key in _inflight:
+        # Предыдущий запрос этого треда ещё в очереди или в работе: новые
         # сообщения остаются в буфере и станут следующими пачками.
         pending = len(batch.messages) if batch is not None else 0
-        pending += sum(len(item.messages) for item in _backlog.get(chat_id, []))
+        pending += sum(len(item.messages) for item in _backlog.get(key, []))
         if pending:
             logger.debug(
-                f"MAX: чат {chat_id} занят, {pending} сообщ. "
+                f"MAX: тред {key} занят, {pending} сообщ. "
                 "ждут следующей пачки"
             )
-            _schedule_flush(chat_id)
+            _schedule_flush(key)
         return None
 
-    batch = _take_next_batch(chat_id)
+    batch = _take_next_batch(key)
     if batch is None:
-        _batches.pop(chat_id, None)
+        _batches.pop(key, None)
         return None
 
+    chat_id = batch.chat_id or key.split("#", 1)[0]
+    post_id = batch.post_id
     # Копия списка: пока идёт await ниже, в batch.messages могут дописаться
     # новые сообщения, и они не должны попасть в уже собранный текст.
     messages = list(batch.messages)
@@ -452,7 +494,7 @@ async def _flush_batch(chat_id: str, reason: str = "тишина") -> Request | 
     batch.messages.clear()
     batch.trust_flags.clear()
     batch.chars = 0
-    _inflight.add(chat_id)
+    _inflight.add(key)
 
     # Отметки о событиях (удаление, правка и т.п.) идут перед сообщениями:
     # агент видит, что успело случиться, но хода по ним не было.
@@ -462,9 +504,10 @@ async def _flush_batch(chat_id: str, reason: str = "тишина") -> Request | 
         text=text,
         source="max",
         chat_id=chat_id,
+        post_id=post_id,
         trusted=trusted,
         send_reasoning=config.MAX_SEND_REASONING,
-        reply=_BatchReply(MaxReply(runtime.bot, chat_id), chat_id),
+        reply=_BatchReply(MaxReply(runtime.bot, chat_id, post_id), key),
     )
     try:
         await runtime.queue.put(request)
@@ -474,44 +517,44 @@ async def _flush_batch(chat_id: str, reason: str = "тишина") -> Request | 
         batch.messages[0:0] = messages
         batch.trust_flags[0:0] = [trusted] * len(messages)
         batch.chars = sum(len(m) for m in batch.messages) + 2 * (len(batch.messages) - 1)
-        _inflight.discard(chat_id)
-        _backlog.setdefault(chat_id, []).insert(0, batch)
-        _schedule_flush(chat_id)
+        _inflight.discard(key)
+        _backlog.setdefault(key, []).insert(0, batch)
+        _schedule_flush(key)
         raise
 
     logger.info(
-        f"[{request.id}] пачка MAX из чата {chat_id} поставлена в очередь "
+        f"[{request.id}] пачка MAX из треда {key} поставлена в очередь "
         f"({len(messages)} сообщ., {len(text)} симв., причина={reason}, "
-        f"trusted={trusted})"
+        f"chat_id={chat_id}, post_id={post_id}, trusted={trusted})"
     )
     return request
 
 
-def _finish_batch(chat_id: str) -> None:
-    """Ответ по пачке отправлен — чат свободен, буфер можно отдавать."""
-    _inflight.discard(chat_id)
-    if _has_pending(chat_id):
-        _schedule_flush(chat_id, delay=0.0)
+def _finish_batch(key: str) -> None:
+    """Ответ по пачке отправлен — тред свободен, буфер можно отдавать."""
+    _inflight.discard(key)
+    if _has_pending(key):
+        _schedule_flush(key, delay=0.0)
 
 
 class _BatchReply:
-    """``MaxReply``, который освобождает чат после отправки ответа."""
+    """``MaxReply``, который освобождает тред после отправки ответа."""
 
-    def __init__(self, inner: MaxReply, chat_id: str) -> None:
+    def __init__(self, inner: MaxReply, key: str) -> None:
         self._inner = inner
-        self._chat_id = chat_id
+        self._key = key
 
     async def send_text(self, text: str) -> None:
         try:
             await self._inner.send_text(text)
         finally:
-            _finish_batch(self._chat_id)
+            _finish_batch(self._key)
 
     async def send_error(self, text: str) -> None:
         try:
             await self._inner.send_error(text)
         finally:
-            _finish_batch(self._chat_id)
+            _finish_batch(self._key)
 
 
 class _RateLimited(Exception):
@@ -525,12 +568,24 @@ async def _defer_without_attachments(update: dict[str, Any]) -> None:
     text = (data.get("text") or "").strip()
     if not chat_id or not text:
         return
-    header = (
-        f"[MAX messenger | chat_id={chat_id} | user_id={data.get('user_id')} "
-        f"| sender={data.get('sender_name')} | attachments=none "
-        f"| trusted={data.get('trusted')}]"
+    user_id = data.get("user_id")
+    trusted = config.is_trusted(
+        str(chat_id), str(user_id) if user_id else None
     )
-    await _buffer_message(chat_id, f"{header}\n{text}", data.get("trusted", False))
+    header = f"[MAX messenger | chat_id={chat_id}"
+    if data.get("post_id"):
+        header += f" | post_id={data['post_id']} | channel_comment=true"
+    header += (
+        f" | user_id={data.get('user_id')} "
+        f"| sender={data.get('sender_name')} | attachments=none "
+        f"| trusted={'true' if trusted else 'false'}]"
+    )
+    await _buffer_message(
+        chat_id,
+        f"{header}\n{text}",
+        trusted,
+        post_id=data.get("post_id"),
+    )
 
 
 # События, на которые НЕ нужен ход агента: только отметка в контексте.
@@ -646,13 +701,13 @@ async def _process_update(update: dict[str, Any]) -> None:
     prepared = await _prepare_message(update)
     if prepared is None:
         return
-    chat_id, message_text, trusted = prepared
-    await _buffer_message(chat_id, message_text, trusted)
+    chat_id, message_text, trusted, post_id = prepared
+    await _buffer_message(chat_id, message_text, trusted, post_id=post_id)
 
 
 async def _prepare_message(
     update: dict[str, Any],
-) -> tuple[str, str, bool] | None:
+) -> tuple[str, str, bool, str | None] | None:
     """Разобрать обновление в готовый текст сообщения, не отправляя его."""
     data = _extract(update)
     chat_id = data["chat_id"]
@@ -847,6 +902,8 @@ async def _prepare_message(
         )
 
     header = f"[MAX messenger | chat_id={chat_id}"
+    if data.get("post_id"):
+        header += f" | post_id={data['post_id']} | channel_comment=true"
     if user_id:
         header += f" | user_id={user_id}"
     if data["sender_name"]:
@@ -856,7 +913,7 @@ async def _prepare_message(
     )
     header += f" | trusted={'true' if trusted else 'false'}]"
 
-    return chat_id, f"{header}\n{content}", trusted
+    return chat_id, f"{header}\n{content}", trusted, data.get("post_id")
 
 
 def _describe_attachment(item: tuple[str, str, dict[str, Any]]) -> str:

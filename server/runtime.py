@@ -108,6 +108,7 @@ async def worker_loop(rt: "Runtime") -> None:
             request_id=req.id,
             source=req.source,
             chat_id=req.chat_id,
+            post_id=req.post_id,
             client_id=req.client_id,
             voice_session_id=req.voice_session_id,
             trusted=req.trusted,

@@ -300,6 +300,20 @@ async def max_send_message(
     if bot is None:
         return {"ok": False, "error": "MAX bot not available"}
 
+    # Если ход пришёл из комментария канала, POST /messages создал бы новый
+    # пост. Модель может по привычке вызвать max_send_message — отправляем
+    # такой вызов комментарием под тем же постом.
+    current_post_id = _current_post_id(chat_id)
+    if current_post_id:
+        logger.info(
+            "MAX tool: max_send_message в треде комментариев -> "
+            f"комментарий к post_id={current_post_id}"
+        )
+        result = await max_send_comment_reply(current_post_id, text, format)
+        if isinstance(result, dict):
+            result.setdefault("delivered_as", "comment")
+        return result
+
     # Prepare extra parameters
     extra = {}
     if format == "markdown":
@@ -313,6 +327,53 @@ async def max_send_message(
         return {"ok": True, "result": message}
     reason = delivery_error(result)
     logger.warning(f"MAX tool: send to chat_id={chat_id} failed: {reason}")
+    return _delivery_failure(reason)
+
+
+async def max_send_comment_reply(
+    post_id: str,
+    text: str,
+    format: str = "markdown",
+) -> dict[str, Any]:
+    """Send a comment under a MAX channel post.
+
+    Use this when the incoming message header contains ``channel_comment=true``
+    and ``post_id=...``.  A comment has no attachments; for files/voice use a
+    normal chat (``max_send_file`` / ``max_send_voice``).
+
+    Args:
+        post_id: ``mid`` of the channel post (from the header), not the comment.
+        text: Comment text.
+        format: "markdown" (default) or "plain".
+
+    Returns:
+        dict: {"ok": True, "result": {...}} on success,
+              {"ok": False, "error": "..."} on failure.
+    """
+    post_id = str(post_id or "").strip()
+    if not post_id:
+        return {"ok": False, "error": "post_id is required"}
+    if not text:
+        return {"ok": False, "error": "text is required"}
+
+    bot = _get_bot_from_registry()
+    if bot is None:
+        return {"ok": False, "error": "MAX bot not available"}
+
+    extra: dict[str, Any] = {}
+    if format == "markdown":
+        extra["format"] = "markdown"
+
+    logger.info(
+        f"MAX tool: comment to post_id={post_id}: {text[:50]}..."
+    )
+    result = await bot._api.send_comment_to_post(post_id, text, extra)
+    message = sent_message(result)
+    if message:
+        _mark_current_thread_replied(post_id)
+        return {"ok": True, "result": message, "delivered_as": "comment"}
+    reason = delivery_error(result)
+    logger.warning(f"MAX tool: comment to post_id={post_id} failed: {reason}")
     return _delivery_failure(reason)
 
 
@@ -433,6 +494,45 @@ def _mark_chat_replied(chat_id) -> None:
         ctx.sent_chats.add(str(chat_id))
 
 
+def _current_post_id(chat_id) -> Optional[str]:
+    """post_id текущего комментария, если запрос пришёл из канала.
+
+    Возвращает ``None`` для обычных чатов и для чужих chat_id: ответ в другой
+    чат не должен неожиданно превращаться в комментарий.
+    """
+    try:
+        from server.context import get_request_context
+    except Exception:
+        return None
+    ctx = get_request_context()
+    if ctx is None or not ctx.post_id:
+        return None
+    if (
+        chat_id is not None
+        and ctx.chat_id is not None
+        and str(chat_id) != str(ctx.chat_id)
+    ):
+        return None
+    return str(ctx.post_id)
+
+
+def _mark_current_thread_replied(post_id) -> None:
+    """Подавить финальный ответ, только если ответили в текущем треде.
+
+    Комментарий под другим постом того же канала не должен глушить финальный
+    ответ на исходный комментарий.
+    """
+    try:
+        from server.context import get_request_context
+    except Exception:
+        return
+    ctx = get_request_context()
+    if ctx is None or not ctx.post_id or not ctx.chat_id:
+        return
+    if str(ctx.post_id) == str(post_id):
+        ctx.sent_chats.add(str(ctx.chat_id))
+
+
 # ----------------------------------------------------------------------
 # Tool definitions
 # ----------------------------------------------------------------------
@@ -519,6 +619,34 @@ TOOL_DEFINITIONS: list[tuple] = [
                 },
             },
             "required": ["chat_id", "text"],
+        },
+    ),
+    (
+        "max_send_comment_reply",
+        max_send_comment_reply,
+        "Send a text comment under a MAX channel post. Use it when the incoming "
+        "message header contains `channel_comment=true` and `post_id=...`: a comment "
+        "reply must go to POST /messages/{post_id}/comments, not to the channel as a "
+        "new post. Comments cannot carry attachments. `post_id` is the post's mid, "
+        "not the comment's mid.",
+        {
+            "type": "object",
+            "properties": {
+                "post_id": {
+                    "type": "string",
+                    "description": "mid of the channel post from the `post_id=...` part of the header",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "The comment text to send.",
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Format: 'markdown' (default) or 'plain'.",
+                    "enum": ["markdown", "plain"],
+                },
+            },
+            "required": ["post_id", "text"],
         },
     ),
     (

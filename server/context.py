@@ -16,6 +16,9 @@ class RequestContext:
     request_id: str
     source: str
     chat_id: str | None = None
+    # Пост канала, если запрос пришёл из комментария: ответ должен уйти
+    # комментарием, а не новым постом.
+    post_id: str | None = None
     client_id: str | None = None
     voice_session_id: str | None = None
     trusted: bool = False

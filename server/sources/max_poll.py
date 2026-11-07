@@ -66,7 +66,9 @@ async def poll_max_updates(rt) -> None:
 
     while True:
         try:
-            result = await rt.bot._poll_updates(types="message_created")
+            result = await rt.bot._poll_updates(
+                types="message_created,comment_created"
+            )
             if result.get("ok"):
                 updates = result.get("result") or []
                 logger.debug(

@@ -62,7 +62,8 @@ This document describes all built‑in tools available to the MASTERMIND v2 agen
 
 | Tool | Rating | Notes |
 |------|--------|-------|
-| `max_send_message` | ★★★★★ | **Send plain text or Markdown messages.** Takes `chat_id` (numeric string) and `text`. Use `format="markdown"` (default) for bold, italic, lists, etc.; use `format="plain"` for raw text (e.g., logs, code). The `chat_id` is always available in the user's message context (e.g., `Current chat_id: 12345`). |
+| `max_send_message` | ★★★★★ | **Send plain text or Markdown messages.** Takes `chat_id` (numeric string) and `text`. Use `format="markdown"` (default) for bold, italic, lists, etc.; use `format="plain"` for raw text (e.g., logs, code). The `chat_id` is always available in the user's message context (e.g., `Current chat_id: 12345`). In a channel comment thread (`channel_comment=true`) the call is redirected to a comment under the current post, so prefer `max_send_comment_reply` for clarity. |
+| `max_send_comment_reply` | ★★★★★ | **Reply as a comment under a channel post.** Takes `post_id` (the post's `mid` from the header, not the comment's) and `text`. Use it when the header has `channel_comment=true`; `max_send_message` would create a new channel post. Comments cannot carry attachments or voice. |
 | `max_send_file` | ★★★★☆ | Uploads a local file by absolute path to a MAX chat. Requires `chat_id` and `absolute_path`. Optionally add a `caption`. |
 | `max_download_file` | ★★★☆☆ | Downloads a file from MAX using a `file_token`. **Known issue:** returns 404 for direct token downloads. **Workaround:** use Python script with CDN URL from attachment payload. |
 | `max_send_voice` | ★★★★★ | **Combines ElevenLabs TTS and voice message.** Generates speech from `text` via ElevenLabs (`eleven_multilingual_v2`) and sends it as a voice message to the given `chat_id`. **Important:** input text must be TTS‑ready – no code, no URLs, no excessive markup. Language is auto-detected. |
@@ -187,6 +188,7 @@ Routing rules:
 **MAX Messenger specifics:**
     - **Always obtain `chat_id`** from the user's message context (shown as `Current chat_id: ...`). Do not guess or hardcode chat IDs unless explicitly provided.
     - **Prefer `max_send_message` for textual replies** — use Markdown formatting (`format="markdown"`) for readability, unless you need to send raw code or logs, then use `format="plain"`.
+    - **Channel comments:** if the header has `channel_comment=true` and `post_id=...`, the reply belongs under that post. The final answer is delivered there automatically; for a manual send use `max_send_comment_reply(post_id=..., text=...)`. Do not use `max_send_message` in a channel thread — it would create a new post (the tool redirects it to the current comment, but the intent is clearer with the dedicated tool). Comments cannot carry files or voice.
     - **For file sharing:** use `max_send_file` with an absolute path. The file must exist on the filesystem; the tool handles upload and attachment automatically.
     - **For voice replies:** use `max_send_voice` (ElevenLabs). Ensure the `text` is short, plain, and free of markup; prefer natural language.
     - **Incoming MAX attachments:** the message header shows `attachments=<types>` (or `none`). Voice transcripts appear under `[Voice Message Transcript]`; download/transcription failures appear under `[Attachment processing notes]` while the original text is preserved.

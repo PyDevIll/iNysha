@@ -42,11 +42,17 @@ class FutureReply:
 
 
 class MaxReply:
-    """Sends the final answer to the originating MAX chat."""
+    """Sends the final answer to the originating MAX chat.
 
-    def __init__(self, bot: Any, chat_id: str | int) -> None:
+    Для канала с обсуждением ``post_id`` задан: ответ уходит комментарием под
+    тем постом, где пользователь оставил комментарий (``POST /messages/{id}/comments``).
+    Без ``post_id`` — обычное сообщение в чат (``POST /messages``).
+    """
+
+    def __init__(self, bot: Any, chat_id: str | int, post_id: str | int | None = None) -> None:
         self.bot = bot
         self.chat_id = str(chat_id)
+        self.post_id = str(post_id) if post_id not in (None, "") else None
 
     async def send_text(self, text: str) -> None:
         if not text:
@@ -57,10 +63,15 @@ class MaxReply:
                 f"MAX chat {self.chat_id} already answered by a tool; skipping final send"
             )
             return
-        result = await self.bot.send_message(int(self.chat_id), text)
+        if self.post_id:
+            result = await self.bot.send_comment(self.post_id, text)
+            target = f"post {self.post_id} (comment)"
+        else:
+            result = await self.bot.send_message(int(self.chat_id), text)
+            target = f"chat {self.chat_id}"
         if isinstance(result, dict) and not result.get("ok"):
             logger.error(
-                f"MAX final reply to chat {self.chat_id} not delivered: "
+                f"MAX final reply to {target} not delivered: "
                 f"{result.get('error') or 'unknown error'}"
             )
 
